@@ -7,8 +7,8 @@
 This repository represents an effort to gather containerized PQC applications together in one place with their Quantum (inspired) PoC
 
 ### PQC applications are
-- NginX
-- SSH
+- [NginX](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-nginx)
+- [SSH](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-ssh)
 
 
 ### Quantum (Insprired) PoC are

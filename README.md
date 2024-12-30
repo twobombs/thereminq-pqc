@@ -1,6 +1,6 @@
 # ThereminQ-PQC
 
-![Gemini_Generated_Image_wt29dqwt29dqwt29](https://github.com/user-attachments/assets/a0c6890f-420d-4d2a-af88-3e93dcf9b7c1)
+![Gemini_Generated_Image_wt29dqwt29dqwt29_1_50_1_50](https://github.com/user-attachments/assets/d9f55041-7723-49e3-b693-389e4f373b0e)
 
 ## PQC applications with Quantum (inspired) PoC
 

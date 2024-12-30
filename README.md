@@ -15,5 +15,5 @@ Quantum (Insprired) PoC are
 - Qimcifa/findafactor
 - Shors'
 
-images will be delivered experimentally ready and/or with ThereminQ WebUI
+Container images will be delivered experimentally ready and/or with ThereminQ WebUI
 

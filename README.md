@@ -4,14 +4,14 @@
 
 PQC applications with Quantum (inspired) PoC
 
-This repository represents an effort to gather containerized PQC applications together in one place with their Quantum (inspired) PoC
+## This repository represents an effort to gather containerized PQC applications together in one place with their Quantum (inspired) PoC
 
-PQC applications are
+### PQC applications are
 - NginX
 - SSH
 
 
-Quantum (Insprired) PoC are
+### Quantum (Insprired) PoC are
 - Qimcifa/findafactor
 - Shors'
 

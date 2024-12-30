@@ -1,0 +1,11 @@
+# initial config from https://github.com/open-quantum-safe/openssh
+FROM ubuntu:2404
+ENV OPENSSL_SYS_DIR=/usr/lib/ssl
+
+RUN apt install -y autoconf automake cmake gcc libtool libssl-dev make ninja-build zlib1g-dev openssl && apt clean all
+RUN mkdir -p -m 0755 /var/empty && groupadd sshd && useradd -g sshd -c 'sshd privsep' -d /var/empty -s /bin/false sshd
+
+RUN git clone https://github.com/open-quantum-safe/openssh.git
+RUN cd openssh && sh ./oqs-scripts/clone_liboqs.sh && sh ./oqs-scripts/build_liboqs.sh && sh ./oqs-scripts/build_openssh.sh
+
+ENTRYPOINT /root/run

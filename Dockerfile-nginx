@@ -1,7 +1,7 @@
 # initial setup from https://www.linode.com/docs/guides/post-quantum-encryption-nginx-ubuntu2404/
 FROM ubuntu:2404
 
-RUN apt install -y cmake libssl-dev ninja-build openssl git nginx && apt clean all
+RUN apt install -y cmake libssl-dev ninja-build openssl git nginx php-fpm && apt clean all
 RUN git clone https://github.com/open-quantum-safe/oqs-provider.git && cd oqs-provider && sh ./scripts/fullbuild.sh && cmake --install _build && sh ./scripts/runtests.sh
 
 COPY pqcssl.conf /etc/ssl/openssl.cnf 

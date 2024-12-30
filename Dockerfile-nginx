@@ -4,12 +4,13 @@ FROM ubuntu:2404
 RUN apt install -y cmake libssl-dev ninja-build openssl git nginx php-fpm && apt clean all
 RUN git clone https://github.com/open-quantum-safe/oqs-provider.git && cd oqs-provider && sh ./scripts/fullbuild.sh && cmake --install _build && sh ./scripts/runtests.sh
 
-COPY pqcssl.conf /etc/ssl/openssl.cnf 
+COPY pqcssl.conf /etc/ssl/openssl.cnf
 RUN openssl list -providers && openssl list -kem-algorithms -provider oqsprovider | egrep -i "(kyber|kem)768"
 
 RUN mkdir /opt/certs && openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /opt/certs/pqc.key -out /opt/certs/pqc.crt
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY pqcnginx.conf /etc/nginx/conf.d/pqc.conf
+COPY nginx.conf /etc/nginx
+COPY pqcnginx.conf /etc/nginx/conf.d
 RUN echo "phpinfo();" > /var/www/html/index.php
+COPY curveinfo.php /var/www/html
 
 ENTRYPOINT /root/run

@@ -11,7 +11,7 @@ This repository represents an effort to gather containerized PQC applications to
 - [SSH](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-ssh)
 
 
-### Quantum (Insprired) PoC are
+### Quantum (Inspired) PoCs are
 - [Qimcifa](https://github.com/vm6502q/qimcifa)
 - [FindAfactor](https://github.com/vm6502q/FindAFactor)
 - [Shors'](https://github.com/twobombs/thereminq-tensors/tree/master?tab=readme-ov-file#shors-rsa-ssh-keypair-factorization-and-2-primes-test-loop)

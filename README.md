@@ -1,4 +1,4 @@
-# ThereminQ-PQC
+# ThereminQ-PQC 2025 - alpha
 
 ![Gemini_Generated_Image_wt29dqwt29dqwt29_1_50_1_50](https://github.com/user-attachments/assets/d9f55041-7723-49e3-b693-389e4f373b0e)
 

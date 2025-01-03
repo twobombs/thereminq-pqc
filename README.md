@@ -11,6 +11,11 @@ This repository represents an effort to gather containerized PQC applications to
 - [NginX](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-nginx)
 - [SSH](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-ssh)
 
+### Roadmap 2025
+- AI connectors
+- Database connections
+- Agentic PQC scans
+- BTC-SHA analysis
 
 ### Quantum (Inspired) PoCs are
 - [Qimcifa](https://github.com/vm6502q/qimcifa) [FindAfactor](https://github.com/vm6502q/FindAFactor)

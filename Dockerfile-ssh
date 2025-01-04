@@ -1,5 +1,5 @@
 # initial config from https://github.com/open-quantum-safe/openssh
-FROM ubuntu:2404
+FROM ubuntu:24.04
 ENV OPENSSL_SYS_DIR=/usr/lib/ssl
 
 RUN apt install -y autoconf automake cmake gcc libtool libssl-dev make ninja-build zlib1g-dev openssl && apt clean all

@@ -3,6 +3,7 @@ FROM ubuntu:2204
 RUN apt update && apt install -y python python-pip && apt clean all
 RUN git clone https://github.com/vm6502q/FindAFactor && cd FindAFactor && pip install .
 
-COPY findafactor.py /root
+COPY findafactor.py /
+COPY run-findafactor.sh
 
-ENTRYPOINT python3 findaforctor.py 
+ENTRYPOINT /root/run-findafactor.sh 

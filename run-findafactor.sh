@@ -5,5 +5,5 @@ for i in {65535..4294967295..65535}; do
   i2=$((prime + prime))
   prime2=$(matho-primes -c 1 -u $i2)
   fact=$((prime * prime2))
-  python3 findafactor.py $fact
+  python3 /FindAFactor/find_a_factor.py $fact
 done

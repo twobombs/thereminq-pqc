@@ -1,3 +1,4 @@
+# 32 bit sanity check
 #!/bin/bash
 
 for i in {65535..4294967295..65535}; do

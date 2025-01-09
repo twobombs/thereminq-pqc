@@ -1,3 +1,4 @@
+# created with nemotron 70B6Q
 import FindAFactor
 import time
 

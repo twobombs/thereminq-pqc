@@ -7,7 +7,7 @@ wheel_levels = range(5, 8)  # 5 to 7
 gear_levels = range(11, 14)  # 11 to 13
 
 # Common parameters
-use_congruence_of_squares = False  # As per original request, but consider setting to True for broader technique leverage
+use_congruence_of_squares = True  # As per original request, but consider setting to True for broader technique leverage
 use_gaussian_elimination = True
 node_count = 1
 node_id = 0

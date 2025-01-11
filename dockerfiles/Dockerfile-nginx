@@ -14,5 +14,5 @@ COPY /miscfiles/pqcnginx.conf /etc/nginx/conf.d
 RUN echo "phpinfo();" > /var/www/html/index.php
 COPY /miscfiles/curveinfo.php /var/www/html
 
-COPY /miscfiles/run /root/
+COPY /runfiles/run /root/
 ENTRYPOINT /root/run

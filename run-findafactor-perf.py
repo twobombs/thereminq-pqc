@@ -12,7 +12,7 @@ use_gaussian_elimination = True
 node_count = 1
 node_id = 0
 smoothness_bound_multiplier = 1.0
-batch_size_multiplier = 256.0
+batch_size_multiplier = 512.0
 
 # **Get User Input for to_factor**
 while True:

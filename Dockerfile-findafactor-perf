@@ -1,0 +1,3 @@
+FROM: twobombs/thereminq-pqc:findafactor
+
+ENTRYPOINT /root/run-findafactor-perf.sh

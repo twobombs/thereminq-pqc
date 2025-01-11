@@ -12,7 +12,7 @@ This repository represents an effort to gather containerized PQC applications to
 - [SSH](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-ssh)
 
 ### Roadmap 2025
-- Data driven middleware connections
+- Data driven middleware connection scans
 - Agentic PQC scans
 - AI connectors
 - BTC-SHA analysis

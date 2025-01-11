@@ -8,6 +8,7 @@ gear_levels = range(11, 14)  # 11 to 13
 
 # Common parameters
 use_congruence_of_squares = False  # As per original request, but consider setting to True for broader technique leverage
+use_gaussian_elimination = True
 node_count = 1
 node_id = 0
 smoothness_bound_multiplier = 1.0
@@ -41,6 +42,7 @@ for wheel_factorization_level in wheel_levels:
             factor = FindAFactor.find_a_factor(
                 to_factor,
                 use_congruence_of_squares=use_congruence_of_squares,
+                use_gaussian_elimination=use_gaussian_elimination,
                 node_count=node_count, node_id=node_id,
                 gear_factorization_level=gear_factorization_level,
                 wheel_factorization_level=wheel_factorization_level,

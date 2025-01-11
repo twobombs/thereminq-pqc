@@ -8,5 +8,5 @@ RUN mkdir -p -m 0755 /var/empty && groupadd sshd && useradd -g sshd -c 'sshd pri
 RUN git clone https://github.com/open-quantum-safe/openssh.git
 RUN cd openssh && bash ./oqs-scripts/clone_liboqs.sh && bash ./oqs-scripts/build_liboqs.sh && bash ./oqs-scripts/build_openssh.sh
 
-COPY run /root
+COPY /miscfiles/run /root
 ENTRYPOINT /root/run

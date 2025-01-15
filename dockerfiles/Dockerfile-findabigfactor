@@ -1,3 +1,0 @@
-FROM: twobombs/thereminq-pqc:findafactor
-
-ENTRYPOINT python3 /root/run-findafactor-perf.py

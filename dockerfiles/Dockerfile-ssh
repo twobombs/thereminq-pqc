@@ -2,7 +2,7 @@
 FROM ubuntu:24.04
 ENV OPENSSL_SYS_DIR=/usr/lib/ssl
 
-RUN apt install -y autoconf automake cmake gcc git libtool libssl-dev make ninja-build zlib1g-dev openssl && apt clean all
+RUN apt update && apt install -y autoconf automake cmake gcc git libtool libssl-dev make ninja-build zlib1g-dev openssl && apt clean all
 RUN mkdir -p -m 0755 /var/empty && groupadd sshd && useradd -g sshd -c 'sshd privsep' -d /var/empty -s /bin/false sshd
 
 RUN git clone https://github.com/open-quantum-safe/openssh.git

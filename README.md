@@ -18,7 +18,7 @@ This repository represents an effort to gather containerized PQC applications to
 - BTC-SHA analysis
 
 ### Quantum (Inspired) PoCs are
-- [Qimcifa](https://github.com/vm6502q/qimcifa) [FindAfactor](https://github.com/vm6502q/FindAFactor)
+- [Qimcifa](https://github.com/vm6502q/qimcifa) inspired [FindAfactor](https://github.com/vm6502q/FindAFactor)
 ```bash
 docker run twobombs/thereminq-pqc:findafactor[-cluster]
 ````

@@ -30,7 +30,7 @@ while true; do
 
 
   # Run qimcifa with the calculated number
-  echo $fact | python3 /FindAFactor/tuner.py $1
+  echo $fact | python3 /FindAFactor/find_a_factor $1
 
   # Calculate the next power of 2
   i=$(echo "$i * 2" | bc)

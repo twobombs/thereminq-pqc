@@ -11,6 +11,9 @@ while true; do
   # Calculate the length in bits
   bits=$(echo "l($i)/l(2)" | bc -l | awk '{print int($0+0.5)}')
 
+  echo
+  echo "number of primary bits: $bits"
+
   # Double the prime number
   bits2=$(($bits + 1))
 
@@ -29,8 +32,7 @@ while true; do
   factbits=$(echo "l($fact)/l(2)" | bc -l | awk '{print int($0+0.5)}')
 
   # Print the result
-  echo "number of bits: $bits"
-
+  echo "number of bits in factorial: $factbits"
 
   # Run qimcifa with the calculated number
   time python3 /FindAFactor/find_a_factor $(echo $fact)

@@ -3,6 +3,9 @@
 
 i=4294967295
 
+# no lienwrap in BC output
+export BC_LINE_LENGTH=0
+
 while true; do
 
   # Calculate the length in bits
@@ -16,7 +19,7 @@ while true; do
   prime2=$(openssl prime -generate -bits $bits2)
 
   # Calculate the product of the two primes
-  fact=$(awk "BEGIN {printf \"%.0f\n\", $prime * $prime2}")
+  fact=$(echo "scale=1024; $prime * $prime2" | bc) 
 
   echo $prime
   echo $prime2

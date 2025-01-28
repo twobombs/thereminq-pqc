@@ -23,7 +23,7 @@ This repository represents an effort to gather containerized PQC applications to
 ```bash
 docker run [--cpus=12 --cpuset-cpus=0-11 --cpuset-mems=0 -m 8192m] twobombs/thereminq-pqc:findafactor
 ````
-findafactor is NUMA sensitive; we recommend binding every findafactor instance to a NUMA cluster of cpu threads as per docker and system specifications
+findafactor is NUMA sensitive; we recommend binding every instance to a NUMA cluster of cpu threads per docker and system specifications
 
 - [Shors'](https://github.com/twobombs/thereminq-tensors/tree/master?tab=readme-ov-file#shors-rsa-ssh-keypair-factorization-and-2-primes-test-loop)
 

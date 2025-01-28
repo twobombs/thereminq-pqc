@@ -21,8 +21,10 @@ This repository represents an effort to gather containerized PQC applications to
 ### Quantum (Inspired) PoCs are
 - [Qimcifa](https://github.com/vm6502q/qimcifa) inspired [FindAfactor](https://github.com/vm6502q/FindAFactor)
 ```bash
-docker run twobombs/thereminq-pqc:findafactor[-cluster]
+docker run [--cpus=12 --cpuset-cpus=0-11 --cpuset-mems=0 -m 8192m] twobombs/thereminq-pqc:findafactor
 ````
+findafactor is NUMA sensitive; we recommend binding every findafactor instance to a NUMA cluster of cpu threads as per docker and system specifications
+
 - [Shors'](https://github.com/twobombs/thereminq-tensors/tree/master?tab=readme-ov-file#shors-rsa-ssh-keypair-factorization-and-2-primes-test-loop)
 
 Container images will be delivered experimentally HPC ready and/or with ThereminQ WebUI

@@ -11,7 +11,7 @@ This repository represents an effort to gather containerized PQC applications to
 - [NginX](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-nginx)
 - [SSH](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-ssh)
 
-### Roadmap 2025
+### Roadmap 2025/2026
 - Clustering of PoC
 - Data driven & middleware connections
 - Agentic PQC scans

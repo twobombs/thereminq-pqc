@@ -7,15 +7,17 @@ inspired from this [X post](https://x.com/twobombs/status/1873662745377435856)
 
 This repository represents an effort to gather containerized PQC applications together in one place with their Quantum (inspired) PoC
 
+Note: because of Ising breakthroughs and related benchmarking QFT related algos are moved to the 2026 timetable
+
 ### PQC applications are
 - [NginX](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-nginx)
 - [SSH](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-ssh)
 
-### Roadmap 2025/2026
-- Clustering of PoC
-- Data driven & middleware connections
+### Roadmap: late 2025/2026+
+- Clustering of PoC appliances
+- Data driven & middleware
 - Agentic PQC scans
-- AI connectors
+- AI MCP functionality
 - BTC-SHA analysis
 
 ### Quantum (Inspired) PoCs are

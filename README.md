@@ -1,36 +1,57 @@
-<img width="5978" height="1578" alt="468390747-272a9fdc-d924-4771-850c-d100f23562f6" src="https://github.com/user-attachments/assets/e50471db-c1cb-4a44-9cbd-e31338d5ba2e" />
-
-
 # ThereminQ-PQC
 
-![Gemini_Generated_Image_wt29dqwt29dqwt29_1_50_1_50](https://github.com/user-attachments/assets/d9f55041-7723-49e3-b693-389e4f373b0e)
+This repository provides a collection of containerized applications for Post-Quantum Cryptography (PQC), along with tools for quantum-inspired cryptanalysis. The project aims to centralize PQC implementations and provide a testbed for evaluating their security.
 
-inspired from this [X post](https://x.com/twobombs/status/1873662745377435856)
-## PQC applications with Quantum (inspired) PoC
+## Repository Structure
 
-This repository represents an effort to gather containerized PQC applications together in one place with their Quantum (inspired) PoC
+The repository is organized into the following directories:
 
-Note: because of Ising breakthroughs and related benchmarking QFT related algos are moved to the 2026 timetable
+- **`dockerfiles/`**: Contains Dockerfiles for building the various PQC and cryptanalysis environments.
+- **`miscfiles/`**: Includes configuration files and scripts used by the Docker containers.
+- **`runfiles/`**: Contains entrypoint scripts for the Docker containers.
 
-### PQC applications are
-- [NginX](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-nginx)
-- [SSH](https://github.com/twobombs/thereminq-pqc/blob/main/Dockerfile-ssh)
+---
 
-### Roadmap: late 2025/2026+
-- Clustering of PoC appliances
-- Data driven & middleware
-- Agentic PQC scans
-- AI MCP functionality
-- BTC-SHA analysis
+## Dockerfiles
 
-### Quantum (Inspired) PoCs are
-- [Qimcifa](https://github.com/vm6502q/qimcifa) inspired [FindAfactor](https://github.com/vm6502q/FindAFactor)
-```bash
-docker run [--cpus=12 --cpuset-cpus=0-11 --cpuset-mems=0 -m 8192m] twobombs/thereminq-pqc:findafactor
-````
-findafactor is NUMA sensitive; we recommend binding every instance to a NUMA cluster of cpu threads per docker and system specifications
+This directory contains the Dockerfiles for building the project's container images.
 
-- [Shors'](https://github.com/twobombs/thereminq-tensors/tree/master?tab=readme-ov-file#shors-rsa-ssh-keypair-factorization-and-2-primes-test-loop)
+### `Dockerfile`
+- **Purpose**: Sets up a base CUDA environment using the `twobombs/cudacluster:2204dev` image. This container is intended for GPU-accelerated workloads.
+- **Usage**: This Dockerfile is likely used as a base for other images or for running CUDA-based applications.
 
-Container images will be delivered experimentally HPC ready and/or with ThereminQ WebUI
+### `Dockerfile-findafactor`
+- **Purpose**: Creates an environment for the `FindAFactor` tool, a Python-based application for prime factorization. It installs Python, build tools, and the `FindAFactor` package from its GitHub repository.
+- **Build Command**: `docker build -t thereminq-pqc:findafactor -f dockerfiles/Dockerfile-findafactor .`
+- **Run Command**: `docker run --rm -it thereminq-pqc:findafactor`
 
+### `Dockerfile-nginx`
+- **Purpose**: Configures an Nginx web server with support for Post-Quantum Cryptography using the Open Quantum Safe (OQS) provider. It sets up TLS v1.3 with PQC key exchange algorithms.
+- **Build Command**: `docker build -t thereminq-pqc:nginx -f dockerfiles/Dockerfile-nginx .`
+- **Run Command**: `docker run --rm -it -p 443:443 thereminq-pqc:nginx`
+
+### `Dockerfile-ssh`
+- **Purpose**: Sets up an SSH server with PQC support, using a custom build of OpenSSH integrated with the OQS library.
+- **Build Command**: `docker build -t thereminq-pqc:ssh -f dockerfiles/Dockerfile-ssh .`
+- **Run Command**: `docker run --rm -it -p 2222:22 thereminq-pqc:ssh`
+
+---
+
+## Miscellaneous Files (`miscfiles/`)
+
+This directory contains various configuration files used by the Docker images.
+
+- **`curveinfo.php`**: A PHP script that checks the SSL curve used by the client's connection and indicates whether it is post-quantum secure.
+- **`nginx.conf`**: A minimal Nginx configuration file.
+- **`pqcnginx.conf`**: The Nginx server block configuration for the PQC-enabled web server, specifying the TLS protocols and PQC key exchange curves.
+- **`pqcssl.conf`**: A minimal SSL configuration file.
+
+---
+
+## Run Files (`runfiles/`)
+
+This directory contains the entrypoint scripts for the Docker containers.
+
+- **`run`**: A simple script (`tail -f /dev/null`) used to keep a container running indefinitely. This is used in the Nginx and SSH containers.
+- **`run-findafactor.sh`**: The entrypoint for the `findafactor` container. This script continuously generates large numbers by multiplying two large prime numbers and then attempts to factor them using the `FindAFactor` tool.
+- **`run-pqc`**: The entrypoint for the base CUDA container. It sets up a virtual desktop environment (Xvfb, XFCE, VNC, and xRDP) and starts a terminal.

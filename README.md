@@ -57,3 +57,6 @@ This directory contains the entrypoint scripts for the Docker containers.
 - **`run`**: A simple script (`tail -f /dev/null`) used to keep a container running indefinitely. This is used in the Nginx and SSH containers.
 - **`run-findafactor.sh`**: The entrypoint for the `findafactor` container. This script continuously generates large numbers by multiplying two large prime numbers and then attempts to factor them using the `FindAFactor` tool.
 - **`run-pqc`**: The entrypoint for the base CUDA container. It sets up a virtual desktop environment (Xvfb, XFCE, VNC, and xRDP) and starts a terminal.
+
+
+<img width="2560" height="8800" alt="The Wallfacer Manifesto" src="https://github.com/user-attachments/assets/20619ee7-f895-4f00-a567-0e1a4c4ddfec" />

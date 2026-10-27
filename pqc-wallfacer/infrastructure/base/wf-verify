@@ -1,0 +1,59 @@
+#!/bin/sh
+# wf-verify <dir> <pubkey.pem>
+#
+# Fail-closed artifact check (PRV-03, PRV-04, PRV-05, WF-02).
+#   1. <dir>/MANIFEST.sha384 must carry a valid ML-DSA-87 signature in MANIFEST.sha384.sig
+#   2. the manifest may not contain absolute paths or '..'
+#   3. every regular file in <dir> must be listed, and every listed file must be present
+#   4. every SHA-384 must match
+# Exit 0 only when all four hold. Any other outcome exits non-zero and prints REFUSED.
+
+set -eu
+
+refuse() {
+    echo "wf-verify: REFUSED $DIR: $1" >&2
+    exit "${2:-1}"
+}
+
+[ "$#" -eq 2 ] || { echo "usage: wf-verify <dir> <pubkey.pem>" >&2; exit 2; }
+DIR=$1
+PUB=$2
+MAN="$DIR/MANIFEST.sha384"
+SIG="$MAN.sig"
+
+[ -d "$DIR" ] || refuse "not a directory" 2
+[ -f "$PUB" ] || refuse "public key $PUB missing" 2
+[ -f "$MAN" ] && [ -f "$SIG" ] || refuse "unsigned (no MANIFEST.sha384 + .sig)" 3
+
+# 1. Key must be ML-DSA-87, and the signature must verify.
+openssl pkey -pubin -in "$PUB" -noout -text 2>/dev/null | head -n 1 | grep -q 'ML-DSA-87' \
+    || refuse "verification key is not ML-DSA-87" 4
+openssl pkeyutl -verify -pubin -inkey "$PUB" -rawin -in "$MAN" -sigfile "$SIG" >/dev/null 2>&1 \
+    || refuse "bad signature" 5
+
+# 2. Paths: relative, no traversal, conservative character set.
+PATHS=$(cut -d ' ' -f 3- "$MAN")
+[ -n "$PATHS" ] || refuse "empty manifest" 6
+if printf '%s\n' "$PATHS" | grep -Eq '^/|(^|/)\.\.(/|$)|[^A-Za-z0-9._/+-]'; then
+    refuse "manifest contains unsafe paths" 6
+fi
+
+# 3. Exact file set: nothing unsigned may sit next to a signed artifact.
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT INT TERM
+printf '%s\n' "$PATHS" | sort > "$TMP/listed"
+( cd "$DIR" && find . -type f ! -name MANIFEST.sha384 ! -name MANIFEST.sha384.sig ) \
+    | sed 's|^\./||' | sort > "$TMP/present"
+if ! cmp -s "$TMP/listed" "$TMP/present"; then
+    echo "wf-verify: file set differs from manifest (< listed only, > present only):" >&2
+    comm -3 "$TMP/listed" "$TMP/present" | sed 's/^\t/> /; t; s/^/< /' >&2
+    refuse "file set mismatch" 7
+fi
+
+# 4. Hashes.
+( cd "$DIR" && sha384sum --strict --quiet -c MANIFEST.sha384 ) >/dev/null 2>&1 \
+    || refuse "hash mismatch" 8
+
+SERIAL=""
+[ -f "$DIR/SERIAL" ] && SERIAL=" serial=$(tr -cd '0-9' < "$DIR/SERIAL")"
+echo "wf-verify: OK $DIR files=$(wc -l < "$TMP/listed")$SERIAL"

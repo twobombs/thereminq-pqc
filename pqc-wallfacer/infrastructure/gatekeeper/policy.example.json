@@ -1,0 +1,31 @@
+{
+  "threshold": 0.5,
+  "timeout_s": 2.0,
+  "tools": {
+    "read_file": {
+      "args": { "path": "/work/[A-Za-z0-9._/-]{1,240}" },
+      "scan_args": [],
+      "consequential": false
+    },
+    "write_file": {
+      "args": { "path": "/work/[A-Za-z0-9._/-]{1,240}", "content": "(?s).{0,200000}" },
+      "scan_args": [],
+      "consequential": false
+    },
+    "run_circuit": {
+      "args": { "script": "/work/[A-Za-z0-9._/-]{1,240}\\.py", "qubits": "[0-9]{1,3}" },
+      "scan_args": [],
+      "consequential": false
+    },
+    "git_commit": {
+      "args": { "message": "(?s).{1,500}" },
+      "scan_args": ["message"],
+      "consequential": false
+    },
+    "delete_file": {
+      "args": { "path": "/work/[A-Za-z0-9._/-]{1,240}" },
+      "scan_args": [],
+      "consequential": true
+    }
+  }
+}

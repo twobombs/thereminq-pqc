@@ -1,0 +1,173 @@
+#!/bin/sh
+# wf-ca — private PQC PKI on OpenSSL 3.5 (PKI-02..PKI-09).
+#
+# Layout under /pki (override with WF_PKI):
+#   root/      root.key root.crt              offline ML-DSA-87 root
+#   root-slh/  root.key root.crt              optional SLH-DSA-SHA2-256s hedge root (PKI-09)
+#   tls/       int.key int.crt ca.cnf ...     issuing intermediate for mTLS leaves
+#   keys/      <name>.key <name>.pub.pem      raw signing keys (artifact, overlay)
+
+set -eu
+umask 077
+
+PKI=${WF_PKI:-/pki}
+LEAF_MAX_DAYS=30
+
+die() { echo "wf-ca: $*" >&2; exit 1; }
+
+is_mldsa87() {   # $1 = file, $2 = -pubin|-in|-req
+    case "$2" in
+        -req) openssl req -in "$1" -noout -text 2>/dev/null | grep -q 'ML-DSA-87' ;;
+        -pubin) openssl pkey -pubin -in "$1" -noout -text 2>/dev/null | head -n 1 | grep -q 'ML-DSA-87' ;;
+        *) openssl pkey -in "$1" -noout -text 2>/dev/null | head -n 1 | grep -q 'ML-DSA-87' ;;
+    esac
+}
+
+rand_serial() { echo "0x$(openssl rand -hex 16)"; }
+
+cmd_init_root() {   # CN
+    cn=${1:?CN required}
+    d="$PKI/root"; [ -e "$d/root.key" ] && die "root already exists in $d"
+    mkdir -p "$d"
+    openssl genpkey -algorithm ML-DSA-87 -out "$d/root.key"
+    openssl req -x509 -new -key "$d/root.key" -subj "/CN=$cn" -days 7300 \
+        -set_serial "$(rand_serial)" \
+        -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -out "$d/root.crt"
+    echo "wf-ca: root created: $d/root.crt (move root.key to offline storage after issuing intermediates)"
+}
+
+cmd_init_root_slh() {   # CN
+    cn=${1:?CN required}
+    d="$PKI/root-slh"; [ -e "$d/root.key" ] && die "SLH-DSA root already exists in $d"
+    mkdir -p "$d"
+    openssl genpkey -algorithm SLH-DSA-SHA2-256s -out "$d/root.key"
+    openssl req -x509 -new -key "$d/root.key" -subj "/CN=$cn" -days 7300 \
+        -set_serial "$(rand_serial)" \
+        -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -out "$d/root.crt"
+    echo "wf-ca: SLH-DSA hedge root created: $d/root.crt"
+}
+
+write_ca_cnf() {
+    cat > "$PKI/tls/ca.cnf" <<EOF
+[ ca ]
+default_ca = wf_tls
+
+[ wf_tls ]
+dir              = $PKI/tls
+database         = \$dir/index.txt
+new_certs_dir    = \$dir/certs
+certificate      = \$dir/int.crt
+private_key      = \$dir/int.key
+serial           = \$dir/serial
+crlnumber        = \$dir/crlnumber
+default_md       = default
+default_days     = $LEAF_MAX_DAYS
+default_crl_days = 7
+policy           = wf_policy
+copy_extensions  = copy
+unique_subject   = no
+x509_extensions  = wf_leaf
+
+[ wf_policy ]
+commonName = supplied
+
+[ wf_leaf ]
+basicConstraints       = critical,CA:FALSE
+keyUsage               = critical,digitalSignature
+extendedKeyUsage       = serverAuth,clientAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid
+EOF
+}
+
+cmd_init_tls() {   # CN
+    cn=${1:?CN required}
+    [ -f "$PKI/root/root.key" ] || die "needs $PKI/root/root.key (run on the offline root host)"
+    d="$PKI/tls"; [ -e "$d/int.key" ] && die "TLS intermediate already exists"
+    mkdir -p "$d/certs"
+    : > "$d/index.txt"
+    openssl rand -hex 16 > "$d/serial"
+    echo 1000 > "$d/crlnumber"
+    openssl genpkey -algorithm ML-DSA-87 -out "$d/int.key"
+    openssl req -new -key "$d/int.key" -subj "/CN=$cn" -out "$d/int.csr"
+    ext=$(mktemp)
+    cat > "$ext" <<'EOF'
+basicConstraints=critical,CA:TRUE,pathlen:0
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
+    openssl x509 -req -in "$d/int.csr" -CA "$PKI/root/root.crt" -CAkey "$PKI/root/root.key" \
+        -set_serial "$(rand_serial)" -days 365 -extfile "$ext" -out "$d/int.crt"
+    rm -f "$ext" "$d/int.csr"
+    cat "$d/int.crt" "$PKI/root/root.crt" > "$d/chain.pem"
+    write_ca_cnf
+    echo "wf-ca: TLS intermediate created: $d/int.crt (chain: $d/chain.pem)"
+}
+
+cmd_sign_csr() {   # csr out.crt [days]
+    csr=${1:?CSR required}; out=${2:?output path required}; days=${3:-$LEAF_MAX_DAYS}
+    [ "$days" -le "$LEAF_MAX_DAYS" ] || die "leaf lifetime capped at $LEAF_MAX_DAYS days (PKI-07)"
+    [ -f "$PKI/tls/ca.cnf" ] || die "no TLS intermediate; run init-tls first"
+    openssl req -in "$csr" -verify -noout >/dev/null 2>&1 || die "CSR self-signature invalid"
+    is_mldsa87 "$csr" -req || die "CSR key is not ML-DSA-87"
+    openssl ca -batch -config "$PKI/tls/ca.cnf" -days "$days" -in "$csr" -out "$out" -notext
+    openssl verify -CAfile "$PKI/root/root.crt" -untrusted "$PKI/tls/int.crt" "$out" >/dev/null \
+        || die "issued certificate does not verify against the chain"
+    echo "wf-ca: issued $out (valid $days days)"
+}
+
+cmd_revoke() {   # crt
+    crt=${1:?certificate required}
+    openssl ca -config "$PKI/tls/ca.cnf" -revoke "$crt"
+    cmd_crl
+}
+
+cmd_crl() {
+    openssl ca -config "$PKI/tls/ca.cnf" -gencrl -out "$PKI/tls/crl.pem"
+    echo "wf-ca: CRL written to $PKI/tls/crl.pem — publish it to every mTLS endpoint (PKI-08)"
+}
+
+cmd_signing_key() {   # name
+    name=${1:?name required}
+    case "$name" in *[!A-Za-z0-9._-]*) die "name may only contain A-Z a-z 0-9 . _ -";; esac
+    d="$PKI/keys"; mkdir -p "$d"
+    [ -e "$d/$name.key" ] && die "$d/$name.key already exists"
+    openssl genpkey -algorithm ML-DSA-87 -out "$d/$name.key"
+    openssl pkey -in "$d/$name.key" -pubout -out "$d/$name.pub.pem"
+    is_mldsa87 "$d/$name.pub.pem" -pubin || die "generated key is not ML-DSA-87"
+    echo "wf-ca: signing key $d/$name.key (public: $d/$name.pub.pem, SHA-384 $(openssl dgst -sha384 -r "$d/$name.pub.pem" | cut -c1-24)...)"
+}
+
+cmd_help() {
+    cat <<'EOF'
+wf-ca — Wallfacer private PQC PKI (OpenSSL 3.5, ML-DSA-87)
+
+  init-root <CN>               offline ML-DSA-87 root, 20 years            PKI-02
+  init-root-slh <CN>           SLH-DSA-SHA2-256s hedge root                PKI-09
+  init-tls <CN>                ML-DSA-87 issuing intermediate, 1 year      PKI-03
+  sign-csr <csr> <out> [days]  mTLS leaf from a node-generated CSR, <=30 d PKI-04, PKI-07, MSH-04
+  revoke <crt>                 revoke and regenerate the CRL               PKI-08
+  crl                          regenerate the CRL                           PKI-08
+  signing-key <name>           raw ML-DSA-87 key, e.g. artifact, overlay  PRV-01, MSH-05
+EOF
+}
+
+sub=${1:-help}; [ "$#" -gt 0 ] && shift
+case "$sub" in
+    init-root)     cmd_init_root "$@" ;;
+    init-root-slh) cmd_init_root_slh "$@" ;;
+    init-tls)      cmd_init_tls "$@" ;;
+    sign-csr)      cmd_sign_csr "$@" ;;
+    revoke)        cmd_revoke "$@" ;;
+    crl)           cmd_crl ;;
+    signing-key)   cmd_signing_key "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) cmd_help >&2; exit 2 ;;
+esac

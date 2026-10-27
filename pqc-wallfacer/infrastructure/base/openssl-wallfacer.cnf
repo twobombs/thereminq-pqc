@@ -1,0 +1,17 @@
+# Wallfacer system-wide OpenSSL policy (PKI-04, PKI-05).
+# Loaded through OPENSSL_CONF in wallfacer/base. Applies to every program linked against libssl
+# that uses the default SSL context configuration.
+
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+MinProtocol = TLSv1.3
+# Hybrid groups only. SecP384r1MLKEM1024 first for CNSA 2.0 alignment; X25519MLKEM768 accepted.
+# A peer offering only X25519 or P-256 fails the handshake.
+Groups = SecP384r1MLKEM1024:X25519MLKEM768

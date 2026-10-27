@@ -1,0 +1,129 @@
+# Wallfacer enclave — first slice.
+# Build images with ./build.sh first (compose does not order dependent builds).
+#
+#   agent_net  internal, no route out: agents <-> gatekeeper only           CMP-03, GATE-01
+#   model_net  internal, no route out: gatekeeper <-> inference only        FW-01
+#   ui_int     internal, no route out: ui <-> gatekeeper, ui <-> ui-door
+#   ui_pub     bridge "wf-ui": ui-door only, published on the WireGuard address;
+#              set WF_FORWARD_IF=wf-ui so the gateway forwards tunnel traffic to it
+#              and nothing else (its forward policy also blocks wf-ui -> internet)
+#   gateway    host network, the only thing that touches the public NIC     NET-01, NET-02
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+
+networks:
+  agent_net:
+    internal: true
+  model_net:
+    internal: true
+  ui_int:
+    internal: true
+  ui_pub:
+    driver_opts:
+      com.docker.network.bridge.name: wf-ui
+
+volumes:
+  gateway_state: {}
+
+secrets:
+  jupyter_token:
+    file: ./runtime/secret/jupyter_token      # >= 32 chars: openssl rand -hex 32
+  vnc_password:
+    file: ./runtime/secret/vnc_password       # 8 chars count for classic VNC auth
+
+services:
+
+  gateway:
+    <<: *hardened
+    image: wallfacer/gateway:latest
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    tmpfs: ["/tmp:size=16m", "/run:size=8m"]
+    environment:
+      WF_PUBLIC_IF: ${WF_PUBLIC_IF:?set WF_PUBLIC_IF in .env}
+      WF_WG_ADDR: ${WF_WG_ADDR:-10.77.0.1/24}
+      WF_RP_PORT: ${WF_RP_PORT:-9999}
+      WF_FORWARD_IF: ${WF_FORWARD_IF:-}
+    volumes:
+      - ./runtime/bundle:/bundle:ro                         # signed peer bundle (MSH-02, MSH-05)
+      - ./runtime/trust/overlay.pub.pem:/trust/overlay.pub.pem:ro
+      - ./runtime/secret/rosenpass:/secret:ro               # generated on this node (MSH-04)
+      - gateway_state:/var/lib/wallfacer                    # accepted bundle serial (rollback guard)
+
+  gatekeeper:
+    <<: *hardened
+    image: wallfacer/gatekeeper:latest
+    networks: [agent_net, model_net, ui_int]
+    environment:
+      WF_UPSTREAM: http://inference:8080
+      WF_OUTPUT_MODE: block
+    volumes:
+      - ./runtime/policy.json:/etc/wallfacer/policy.json:ro  # GATE-04 allow-list
+    mem_limit: 2g
+    cpus: 2
+
+  inference:
+    <<: *hardened
+    image: wallfacer/inference:latest
+    networks: [model_net]
+    devices: ["/dev/dri:/dev/dri"]
+    group_add: ["${RENDER_GID:?set RENDER_GID to the host render group id}"]
+    environment:
+      WF_CTX: ${WF_CTX:-8192}
+      WF_GPU_LAYERS: ${WF_GPU_LAYERS:-999}
+    volumes:
+      - ./runtime/models/current:/models/current:ro          # wf-sign'ed model dir (PRV-03)
+      - ./runtime/trust/artifact.pub.pem:/trust/artifact.pub.pem:ro
+
+  # ThereminQ Jupyter desktop as the enclave UI. Runs as root (upstream image layout),
+  # so it gets no capabilities and no route out instead of a read-only root.
+  ui:
+    image: wallfacer/ui:latest
+    networks: [ui_int]
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    shm_size: 2g
+    devices: ["/dev/dri:/dev/dri", "/dev/kfd:/dev/kfd"]
+    group_add: ["${RENDER_GID:?set RENDER_GID}", "${VIDEO_GID:-44}"]
+    secrets: [jupyter_token, vnc_password]
+    volumes:
+      - ./runtime/ui/work:/notebooks/work                   # persistent notebooks and results
+    mem_limit: ${WF_UI_MEM:-32g}
+
+  ui-door:
+    <<: *hardened
+    image: wallfacer/ui-door:latest
+    networks: [ui_pub, ui_int]
+    ports:
+      - "${WF_UI_BIND:?set WF_UI_BIND to the WireGuard address, e.g. 10.77.0.1}:6080:6080"
+      - "${WF_UI_BIND}:8888:8888"
+    mem_limit: 128m
+
+  # Offline CA / signer. Never started with the enclave; run on the air-gapped host:
+  #   docker compose --profile offline run --rm pki wf-ca help
+  pki:
+    <<: *hardened
+    image: wallfacer/pki:latest
+    profiles: [offline]
+    network_mode: none
+    restart: "no"
+    volumes:
+      - ./runtime/pki:/pki
+      - ./runtime/sign:/sign
+
+  # Agent template: no default route, no DNS; reaches only the gatekeeper (CMP-03..CMP-05).
+  # agent:
+  #   <<: *hardened
+  #   image: your-agent-image
+  #   networks: [agent_net]
+  #   dns: []
+  #   environment:
+  #     WF_GATEKEEPER: http://gatekeeper:8443
+  #   volumes:
+  #     - ./worktrees/task-001:/work

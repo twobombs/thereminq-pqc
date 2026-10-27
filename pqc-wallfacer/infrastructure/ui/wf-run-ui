@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Wallfacer boot script for the ThereminQ Jupyter desktop. Replaces upstream /root/run-boards.
+#
+#   :6080  noVNC desktop (VNC password from secret, x0vncserver bound to localhost)
+#   :8888  Jupyter (token from secret)
+#
+# Reachable only through ui-door on the WireGuard address; the container itself has no route out.
+
+set -euo pipefail
+
+TOKEN_FILE=${WF_JUPYTER_TOKEN_FILE:-/run/secrets/jupyter_token}
+VNC_FILE=${WF_VNC_PASSWORD_FILE:-/run/secrets/vnc_password}
+SCREEN=${WF_SCREEN:-2560x1440x24}
+NOTEBOOKS=${WF_NOTEBOOK_DIR:-/notebooks}
+
+log() { printf '%s ui %s\n' "$(date -u +%FT%TZ)" "$*"; }
+die() { log "FATAL $*"; exit 1; }
+
+[ -s "$TOKEN_FILE" ] || die "Jupyter token secret missing at $TOKEN_FILE"
+[ -s "$VNC_FILE" ] || die "VNC password secret missing at $VNC_FILE"
+JUPYTER_TOKEN=$(tr -d '\r\n' < "$TOKEN_FILE")
+VNC_PW=$(tr -d '\r\n' < "$VNC_FILE")
+[ "${#JUPYTER_TOKEN}" -ge 32 ] || die "Jupyter token shorter than 32 characters"
+[ "${#VNC_PW}" -ge 8 ] || die "VNC password shorter than 8 characters"
+[ "$VNC_PW" != "00000000" ] || die "refusing the upstream default VNC password"
+export JUPYTER_TOKEN             # read by Jupyter itself; never on the command line
+
+# VNC password file (classic VNC auth uses the first 8 characters only).
+mkdir -p /root/.vnc
+printf '%s\n' "$VNC_PW" | vncpasswd -f > /root/.vnc/passwd
+chmod 600 /root/.vnc/passwd
+unset VNC_PW
+
+# Desktop
+rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+Xvfb :0 -screen 0 "$SCREEN" -nolisten tcp &
+export DISPLAY=:0
+sleep 2
+startxfce4 >/dev/null 2>&1 &
+sleep 8
+x0vncserver -display :0 -rfbport 5900 -localhost -passwordfile /root/.vnc/passwd &
+websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+xset s off || true
+
+# Jupyter
+jupyter notebook --notebook-dir="$NOTEBOOKS" --ip 0.0.0.0 --port 8888 --no-browser --allow-root &
+JUPYTER_PID=$!
+sleep 10
+
+# In-desktop clients: browser on the local Jupyter, a terminal, VS Code on the work folder.
+(while kill -0 "$JUPYTER_PID" 2>/dev/null; do
+    google-chrome-stable --disable-fre --no-default-browser-check --no-first-run --no-sandbox \
+        --password-store=basic --disable-background-networking --disable-component-update \
+        --disable-sync --metrics-recording-only "http://127.0.0.1:8888/?token=$JUPYTER_TOKEN" >/dev/null 2>&1
+    sleep 2
+done) &
+exo-open --launch TerminalEmulator >/dev/null 2>&1 &
+code "$NOTEBOOKS" --no-sandbox --disable-dev-shm-usage --user-data-dir /root/ >/dev/null 2>&1 &
+
+log "ready: noVNC :6080, Jupyter :8888, Ai via ${OPENAI_BASE_URL:-unset}"
+
+# Jupyter is the service; if it stops, the container stops and the restart policy takes over.
+wait "$JUPYTER_PID"
+die "Jupyter exited"

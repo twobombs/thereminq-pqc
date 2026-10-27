@@ -1,0 +1,48 @@
+#!/bin/sh
+# wf-sign <dir> <signing-key.pem>
+#
+# Writes <dir>/MANIFEST.sha384 over every regular file in <dir> and signs it with
+# ML-DSA-87 into MANIFEST.sha384.sig (PRV-02..PRV-04, MSH-05). Then re-verifies with
+# wf-verify against the derived public key, so a bad signature never leaves this host.
+#
+# Model directories should contain a model.meta (name, quant, source URL, licence, upstream hash)
+# before signing; it is hashed like every other file (PRV-03, WF-01).
+# Peer bundles should contain a SERIAL file with a strictly increasing integer (MSH-05).
+
+set -eu
+
+[ "$#" -eq 2 ] || { echo "usage: wf-sign <dir> <signing-key.pem>" >&2; exit 2; }
+DIR=$1
+KEY=$2
+
+[ -d "$DIR" ] || { echo "wf-sign: $DIR is not a directory" >&2; exit 2; }
+[ -f "$KEY" ] || { echo "wf-sign: key $KEY not found" >&2; exit 2; }
+KEY=$(realpath "$KEY")
+openssl pkey -in "$KEY" -noout -text 2>/dev/null | head -n 1 | grep -q 'ML-DSA-87' \
+    || { echo "wf-sign: $KEY is not an ML-DSA-87 private key" >&2; exit 4; }
+
+cd "$DIR"
+rm -f MANIFEST.sha384 MANIFEST.sha384.sig
+
+LIST=$(find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+[ -n "$LIST" ] || { echo "wf-sign: $DIR is empty" >&2; exit 6; }
+if printf '%s\n' "$LIST" | grep -Eq '[^A-Za-z0-9._/+-]'; then
+    echo "wf-sign: rename files first; allowed characters are A-Z a-z 0-9 . _ / + -" >&2
+    printf '%s\n' "$LIST" | grep -E '[^A-Za-z0-9._/+-]' >&2
+    exit 6
+fi
+
+# Write and sign under temporary names, then move both into place, so a failed run
+# never leaves a manifest without its signature.
+printf '%s\n' "$LIST" | while IFS= read -r f; do sha384sum -- "$f"; done > .MANIFEST.tmp
+openssl pkeyutl -sign -inkey "$KEY" -rawin -in .MANIFEST.tmp -out .MANIFEST.sig.tmp \
+    || { rm -f .MANIFEST.tmp .MANIFEST.sig.tmp; echo "wf-sign: signing failed" >&2; exit 5; }
+mv .MANIFEST.tmp MANIFEST.sha384
+mv .MANIFEST.sig.tmp MANIFEST.sha384.sig
+
+PUB=$(mktemp)
+trap 'rm -f "$PUB"' EXIT INT TERM
+openssl pkey -in "$KEY" -pubout -out "$PUB"
+cd - >/dev/null
+wf-verify "$DIR" "$PUB"
+echo "wf-sign: signed $(wc -l < "$DIR/MANIFEST.sha384") files in $DIR"

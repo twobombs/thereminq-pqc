@@ -16,6 +16,8 @@ docker build --pull -t wallfacer/base:latest \
 
 docker build -t wallfacer/pki:latest pki
 
+docker build -t wallfacer/keyroll:latest -f keyroll/Dockerfile ..
+
 docker build -t wallfacer/gateway:latest \
     --build-arg RUST_IMAGE="$RUST_IMAGE" \
     --build-arg ROSENPASS_VERSION="$ROSENPASS_VERSION" gateway
@@ -40,6 +42,6 @@ docker build -t wallfacer/ui:latest \
 
 echo
 printf '%-26s %s\n' IMAGE ID
-for i in base pki gateway gatekeeper inference ui-door ui; do
+for i in base pki keyroll gateway gatekeeper inference ui-door ui; do
     printf '%-26s %s\n' "wallfacer/$i" "$(docker image inspect --format '{{.Id}}' "wallfacer/$i:latest")"
 done

@@ -8,7 +8,8 @@ Container images for the first build phases of the Wallfacer requirements (roots
 | --- | --- | --- | --- | --- |
 | `wallfacer/base` | OpenSSL 3.5 policy, `wf-verify`, uid 10001 `wf` | debian:trixie-slim | — | PKI-01, PKI-05, PRV-05 |
 | `wallfacer/pki` | Offline CA (`wf-ca`) and artifact/bundle signer (`wf-sign`) | base | none | PKI-02..09, PRV-01..04, MSH-05 |
-| `wallfacer/gateway` | WireGuard + Rosenpass, nftables default drop, PSK hold-down | base + Rosenpass built from tag | host | NET-01..09, MSH-01..06, MSH-12 |
+| `wallfacer/keyroll` | Offline paper QR key-roll (`wf-keyroll`) — radio/IP alternative for PQC private & static keys | base + Python 3 venv (`segno`, `reportlab`, `zxing-cpp`, `cryptography`) | none | MSH-04, OOB key relay |
+| `wallfacer/gateway` | WireGuard + Rosenpass, nftables default drop, PSK hold-down, paper-QR key verify | base + Rosenpass built from tag | host | NET-01..09, MSH-01..06, MSH-12 |
 | `wallfacer/gatekeeper` | Allow-list, LLM firewall, Merlin on CPU, chat proxy | base + Python 3.13 venv | `agent_net`, `model_net` | GATE-01..08, FW-01..04, FW-08 |
 | `wallfacer/inference` | llama.cpp server on Vulkan, fail-closed GGUF loader | base + llama.cpp built from tag | `model_net` | CMP-01, CMP-02, CMP-09, PRV-05, WF-02 |
 | `wallfacer/ui` | ThereminQ Jupyter desktop: noVNC, Jupyter, VS Code, PyQrack | `twobombs/thereminq-tensors:jupyter` by digest | `ui_int` | CMP-01, CMP-03, CMP-07 |
@@ -26,6 +27,8 @@ Container images for the first build phases of the Wallfacer requirements (roots
 | `TORCH_VERSION` | gatekeeper | `2.9.0` | CPU wheel index only |
 | `MERLIN_HF_REVISION` | gatekeeper | `21b6f2cc…eea5` | Build arg; checkpoint SHA-256 `075d68f8…4c86` checked at build and every start |
 | `THEREMINQ_JUPYTER_IMAGE` | ui | none (required) | `twobombs/thereminq-tensors:jupyter@sha256:…`; `build.sh` refuses a tag without digest |
+| `WF_KEY_RELAY` | gateway runtime | `radio` | `radio` (default) or `paper-qr` (enforces `0600`/`0400` mode and SHA3-256 verification on `/secret/pqsk`) |
+| `WF_PQSK_SHA3_256` | gateway runtime | empty | Optional SHA3-256 hex pin for `/secret/pqsk` (falls back to `/secret/pqsk.sha3_256` from `wf-keyroll decode --write-checksum`) |
 
 `./build.sh` builds in dependency order, pushes nothing, and prints the image IDs to sign.
 
@@ -33,11 +36,12 @@ Container images for the first build phases of the Wallfacer requirements (roots
 
 | Path | Contents | Mounted into |
 | --- | --- | --- |
-| `pki/` | `root/`, `root-slh/`, `tls/`, `keys/` | pki (offline host only) |
+| `pki/` | `root/`, `root-slh/`, `tls/`, `keys/` | pki, keyroll (offline host only) |
+| `keyroll/` | Printable A4 QR PDFs, scanned PNGs, or frame dumps (`WFK1`) | keyroll (offline host only) |
 | `trust/overlay.pub.pem` | ML-DSA-87 public key that signs peer bundles | gateway |
 | `trust/artifact.pub.pem` | ML-DSA-87 public key that signs models | inference |
 | `bundle/` | `SERIAL`, `peers.conf`, `peers/<name>/`, manifest + sig | gateway (ro) |
-| `secret/rosenpass/` | This node's `rp genkey` output; never leaves the node | gateway (ro) |
+| `secret/rosenpass/` | This node's `rp genkey` output, or paper-QR decoded `pqsk` (+ optional `pqsk.sha3_256`) | gateway (ro), keyroll (offline) |
 | `models/current/` | One `.gguf`, `model.meta`, optional `chat_template.jinja`, manifest + sig | inference (ro) |
 | `policy.json` | Gatekeeper allow-list (`gatekeeper/policy.example.json` as template) | gatekeeper (ro) |
 | `secret/jupyter_token` | ≥ 32 characters, e.g. `openssl rand -hex 32` | ui (compose secret) |
@@ -54,11 +58,25 @@ Container images for the first build phases of the Wallfacer requirements (roots
 | 2 | Offline host | `… pki wf-ca init-root-slh "Wallfacer SLH Root"` |
 | 3 | Offline host | `… pki wf-ca init-tls "Wallfacer TLS 2026"`, then move `root/root.key` to cold storage |
 | 4 | Offline host | `… pki wf-ca signing-key artifact` and `… signing-key overlay` |
-| 5 | Each node | `rp genkey runtime/secret/rosenpass` and `rp pubkey runtime/secret/rosenpass pub` |
+| 5 | Each node | `rp genkey runtime/secret/rosenpass` and `rp pubkey runtime/secret/rosenpass pub` *(or use the Paper QR Relay alternative below to move a PQC private key off-radio)* |
 | 6 | Offline host | Collect `pub/` dirs into `bundle/peers/<name>/`, write `peers.conf` and `SERIAL`, then `… pki wf-sign /sign/bundle /pki/keys/overlay.key` |
 | 7 | Quarantine host | Put GGUF + `model.meta` (name, quant, source URL, licence, upstream hash) in a dir, then `wf-sign <dir> /pki/keys/artifact.key` |
 | 8 | Quarantine host | `docker pull twobombs/thereminq-tensors:jupyter`, record the digest, import the image into the enclave host, set `THEREMINQ_JUPYTER_IMAGE` |
 | 9 | Enclave host | Copy public keys to `runtime/trust/`, bundle and model into `runtime/`, write the two UI secrets, then `docker compose up -d` |
+
+## Alternative to radio network: out-of-band paper QR relay for PQC private keys
+
+When the LoRa / Reticulum radio network is unavailable, denied, or disallowed for private key material, use the air-gapped `wallfacer/keyroll` container (`network_mode: none`) to relay a PQC private key (Rosenpass Classic McEliece `pqsk` or OpenSSL 3.5 ML-DSA-87 / ML-KEM / SLH-DSA `.key`) physically on **2 A4 sheets**, passphrase-sealed with `scrypt` + `AES-256-GCM`:
+
+| Step | Where | Command |
+| --- | --- | --- |
+| A | Provisioning / offline host | `docker compose --profile offline run --rm keyroll wf-keyroll encode /secret/rosenpass/pqsk -o /keyroll/node01-pqsk.pdf --node wf-node-01 --allow-secret --seal` |
+| B | Out-of-band | Print `runtime/keyroll/node01-pqsk.pdf` (2 A4 sheets). Deliver the printed sheets physically, and read the **Key SHA3-256** and seal passphrase over a separate channel. |
+| C | Receiving enclave host (offline) | Scan the sheets into `runtime/keyroll/scans/` and verify before writing: `docker compose --profile offline run --rm keyroll wf-keyroll verify /keyroll/scans/*.png --expect <KEY-SHA3-256>` |
+| D | Receiving enclave host (offline) | Reassemble the private key atomically (mode `600`) and emit its gateway checksum: `docker compose --profile offline run --rm keyroll wf-keyroll decode /keyroll/scans/*.png -o /secret/rosenpass/pqsk --expect <KEY-SHA3-256> --write-checksum` |
+| E | Receiving enclave host | Set `WF_KEY_RELAY=paper-qr` (and optionally `WF_PQSK_SHA3_256=<KEY-SHA3-256>`) in `.env`, shred the printed sheets, and start the enclave with `docker compose up -d`. |
+
+On startup, `gateway-entrypoint.sh` refuses to start Rosenpass if `WF_KEY_RELAY=paper-qr` and `/secret/pqsk` is missing, has permissions wider than `600`/`400`, or fails the SHA3-256 check against `WF_PQSK_SHA3_256` / `/secret/pqsk.sha3_256`. The same `wf-keyroll` workflow also handles PKI private keys under `/pki/keys/` (check fingerprints with `wf-ca fingerprint <file>`) and static public keys (`/sign/bundle/peers/<name>/pqpk`). See [`../README-paper-keyroll.md`](../README-paper-keyroll.md) for sheet counts and scanning guidance.
 
 ## UI (ThereminQ Jupyter desktop)
 
@@ -121,6 +139,7 @@ Public interface accepts only UDP to the Rosenpass port and port + 1 (WireGuard)
 | Item | Status |
 | --- | --- |
 | Firewall layers and gatekeeper decisions | 29 unit tests pass (`python3 -m unittest test_gatekeeper`), Merlin stubbed |
+| Paper QR private-key relay, sealing, PDF/QR round-trip, `wf-ca fingerprint`, gateway `verify_pqsk` | 15 tests pass (`python3 -m unittest ../test_paper_keyroll.py`) |
 | `wf-sign` / `wf-verify` file-set, traversal, tamper, wrong-key, unsigned logic | Passed with an Ed25519 stand-in on OpenSSL 3.0 |
 | Shell syntax | All scripts pass `dash -n` / `bash -n` |
 | ML-DSA-87 sign/verify, `wf-ca` issuance and CRL | Not run: needs OpenSSL 3.5; `openssl ca` with `default_md = default` on ML-DSA is the first thing to confirm |

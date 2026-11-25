@@ -24,6 +24,8 @@ WF_WG_DEV=${WF_WG_DEV:-rosenpass0}
 WF_BUNDLE=${WF_BUNDLE:-/bundle}
 WF_OVERLAY_PUB=${WF_OVERLAY_PUB:-/trust/overlay.pub.pem}
 WF_SECRET=${WF_SECRET:-/secret}
+WF_KEY_RELAY=${WF_KEY_RELAY:-radio}       # radio (default) or paper-qr (air-gapped paper QR relay)
+WF_PQSK_SHA3_256=${WF_PQSK_SHA3_256:-}    # optional SHA3-256 hex pin for $WF_SECRET/pqsk
 WF_STATE=${WF_STATE:-/var/lib/wallfacer}
 WF_FORWARD_IF=${WF_FORWARD_IF:-}          # optional enclave-side interface the tunnel may forward into
 WF_PSK_SETTLE=${WF_PSK_SETTLE:-180}       # >= WireGuard REJECT_AFTER_TIME, so no pre-PSK session survives
@@ -33,7 +35,7 @@ WF_POLL=${WF_POLL:-5}
 log() { printf '%s gateway %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { log "FATAL $*"; exit 1; }
 
-# ---------- 1. bundle ----------
+# ---------- 1. bundle & PQC private key ----------
 wf-verify "$WF_BUNDLE" "$WF_OVERLAY_PUB" || die "peer bundle failed verification"
 serial=$(tr -cd '0-9' < "$WF_BUNDLE/SERIAL")
 [ -n "$serial" ] || die "bundle SERIAL empty"
@@ -41,7 +43,41 @@ last=0
 [ -f "$WF_STATE/serial" ] && last=$(tr -cd '0-9' < "$WF_STATE/serial")
 [ "$serial" -ge "${last:-0}" ] || die "bundle serial $serial older than accepted $last (rollback refused)"
 echo "$serial" > "$WF_STATE/serial"
-[ -d "$WF_SECRET" ] || die "Rosenpass secret dir $WF_SECRET missing (generate on this node: rp genkey)"
+
+case "$WF_KEY_RELAY" in
+    radio|paper-qr) ;;
+    *) die "unsupported WF_KEY_RELAY='$WF_KEY_RELAY' (expected 'radio' or 'paper-qr')" ;;
+esac
+
+[ -d "$WF_SECRET" ] || die "Rosenpass secret dir $WF_SECRET missing (generate with 'rp genkey' or decode paper QR roll with 'wf-keyroll decode')"
+
+verify_pqsk() {
+    local pqsk="$WF_SECRET/pqsk"
+    [ -s "$pqsk" ] || die "PQC private key $pqsk missing or empty"
+    local mode
+    mode=$(stat -c '%a' "$pqsk")
+    case "$mode" in
+        400|600) ;;
+        *) die "PQC private key $pqsk has unsafe mode $mode (expected 600 or 400)" ;;
+    esac
+    local expect="${WF_PQSK_SHA3_256:-}"
+    if [ -z "$expect" ] && [ -f "$pqsk.sha3_256" ]; then
+        expect=$(awk '{print $1; exit}' "$pqsk.sha3_256")
+    fi
+    if [ -n "$expect" ]; then
+        expect=$(printf '%s' "$expect" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+        local actual
+        actual=$(openssl dgst -sha3-256 -r "$pqsk" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
+        [ "$actual" = "$expect" ] || die "PQC private key $pqsk SHA3-256 mismatch (expected $expect, got $actual)"
+        log "PQC private key verified (relay=$WF_KEY_RELAY, SHA3-256=${actual:0:16}...)"
+    else
+        log "PQC private key loaded (relay=$WF_KEY_RELAY)"
+    fi
+}
+
+if [ "$WF_KEY_RELAY" = "paper-qr" ] || [ -n "$WF_PQSK_SHA3_256" ] || [ -f "$WF_SECRET/pqsk.sha3_256" ]; then
+    verify_pqsk
+fi
 
 # ---------- 2. nftables ----------
 apply_ruleset() {

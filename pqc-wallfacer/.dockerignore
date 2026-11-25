@@ -1,0 +1,5 @@
+# Keep the build context for wallfacer/keyroll minimal (built from pqc-wallfacer/).
+*
+!wallfacer_paper_keyroll.py
+!infrastructure/keyroll/
+!infrastructure/keyroll/**

@@ -145,6 +145,14 @@ cmd_signing_key() {   # name
     echo "wf-ca: signing key $d/$name.key (public: $d/$name.pub.pem, SHA-384 $(openssl dgst -sha384 -r "$d/$name.pub.pem" | cut -c1-24)...)"
 }
 
+cmd_fingerprint() {   # file
+    f=${1:?file required}
+    [ -f "$f" ] || die "file not found: $f"
+    fp=$(openssl dgst -sha3-256 -r "$f" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
+    echo "wf-ca: SHA3-256 $f"
+    echo "  $fp"
+}
+
 cmd_help() {
     cat <<'EOF'
 wf-ca — Wallfacer private PQC PKI (OpenSSL 3.5, ML-DSA-87)
@@ -156,6 +164,7 @@ wf-ca — Wallfacer private PQC PKI (OpenSSL 3.5, ML-DSA-87)
   revoke <crt>                 revoke and regenerate the CRL               PKI-08
   crl                          regenerate the CRL                           PKI-08
   signing-key <name>           raw ML-DSA-87 key, e.g. artifact, overlay  PRV-01, MSH-05
+  fingerprint <file>           print SHA3-256 for out-of-band paper QR check
 EOF
 }
 
@@ -168,6 +177,7 @@ case "$sub" in
     revoke)        cmd_revoke "$@" ;;
     crl)           cmd_crl ;;
     signing-key)   cmd_signing_key "$@" ;;
+    fingerprint)   cmd_fingerprint "$@" ;;
     help|-h|--help) cmd_help ;;
     *) cmd_help >&2; exit 2 ;;
 esac

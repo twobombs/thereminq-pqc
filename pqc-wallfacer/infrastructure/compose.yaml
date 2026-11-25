@@ -49,10 +49,12 @@ services:
       WF_WG_ADDR: ${WF_WG_ADDR:-10.77.0.1/24}
       WF_RP_PORT: ${WF_RP_PORT:-9999}
       WF_FORWARD_IF: ${WF_FORWARD_IF:-}
+      WF_KEY_RELAY: ${WF_KEY_RELAY:-radio}                  # radio (default) or paper-qr
+      WF_PQSK_SHA3_256: ${WF_PQSK_SHA3_256:-}               # optional SHA3-256 pin for pqsk
     volumes:
       - ./runtime/bundle:/bundle:ro                         # signed peer bundle (MSH-02, MSH-05)
       - ./runtime/trust/overlay.pub.pem:/trust/overlay.pub.pem:ro
-      - ./runtime/secret/rosenpass:/secret:ro               # generated on this node (MSH-04)
+      - ./runtime/secret/rosenpass:/secret:ro               # on-node rp genkey or paper-QR decoded pqsk (MSH-04)
       - gateway_state:/var/lib/wallfacer                    # accepted bundle serial (rollback guard)
 
   gatekeeper:
@@ -114,6 +116,21 @@ services:
     network_mode: none
     restart: "no"
     volumes:
+      - ./runtime/pki:/pki
+      - ./runtime/sign:/sign
+
+  # Offline paper QR key-roll encoder/decoder (air-gapped alternative to radio/IP relay
+  # for PQC private keys, Rosenpass static keys, and PSKs). Never started with the enclave:
+  #   docker compose --profile offline run --rm keyroll wf-keyroll --help
+  keyroll:
+    <<: *hardened
+    image: wallfacer/keyroll:latest
+    profiles: [offline]
+    network_mode: none
+    restart: "no"
+    volumes:
+      - ./runtime/keyroll:/keyroll
+      - ./runtime/secret:/secret
       - ./runtime/pki:/pki
       - ./runtime/sign:/sign
 

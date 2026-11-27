@@ -1,0 +1,6 @@
+# Test bed for tests/webconf-e2e.sh: stock Debian nginx + Apache + OpenSSL 3.5, as on a migrated web host.
+ARG DEBIAN_IMAGE=debian:trixie-slim
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nginx apache2 openssl curl python3 ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/*

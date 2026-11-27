@@ -1,0 +1,25 @@
+# In: 8443/8080 from anywhere. Out: DNS and the ingress controller only.
+# Change the namespace label below if the controller does not live in ingress-nginx.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pqc-edge
+  namespace: pqc-edge
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: pqc-edge}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - {port: 8443, protocol: TCP}
+        - {port: 8080, protocol: TCP}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ingress-nginx}

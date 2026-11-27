@@ -1,0 +1,17 @@
+# Edge settings. PQC_UPSTREAM defaults to re-encrypting into the existing ingress controller on 443:
+# the controller keeps routing by Host, sees TLS as before, and needs no forwarded-header configuration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pqc-edge
+  namespace: pqc-edge
+data:
+  PQC_PROFILE: compat
+  PQC_UPSTREAM: https://ingress-nginx-controller.ingress-nginx.svc.cluster.local:443
+  PQC_UPSTREAM_CA: ""
+  PQC_HTTP_REDIRECT: "yes"
+  PQC_FORWARDED_PORT: "443"
+  PQC_PROXY_PROTOCOL: "no"
+  PQC_IPV6: auto
+  PQC_HSTS: ""
+  PQC_RELOAD_INTERVAL: "30"

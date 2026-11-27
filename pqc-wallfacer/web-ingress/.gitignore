@@ -1,0 +1,9 @@
+# generated key material and cluster secrets: never commit
+pqc-ca/
+**/privkey.pem
+**/*.key
+**/csr.pem
+k8s/overlays/*/secrets.yaml
+k8s/overlays/*/sites-patch.yaml
+plan.tsv
+__pycache__/

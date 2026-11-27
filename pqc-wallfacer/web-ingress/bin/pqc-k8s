@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# pqc-k8s: Kubernetes side of the dual certificate stack migration. Needs kubectl, python3, openssl >= 3.5.
+#
+#   pqc-k8s inventory                         ingress controllers, Ingress hosts, TLS secrets and their algorithms
+#   pqc-k8s plan [-o plan.tsv]                one line per site from every Ingress TLS block:
+#                                             <site> <secret-ns>/<secret> <host> [host...]
+#   pqc-k8s csr <plan.tsv> <outdir>           pqc-ca key-csr commands for every site in the plan
+#   pqc-k8s secrets <plan.tsv> <pqc-dir>      YAML: <site>-pqc (from <pqc-dir>/<site>/) and <site>-classic
+#                                             (copied from the Ingress secret) in the edge namespace
+#   pqc-k8s sites-patch <plan.tsv>            YAML: Deployment patch mounting every site into /etc/pqc/sites
+#
+# Options: -n NAMESPACE for the edge (default pqc-edge), --deployment NAME (default pqc-edge).
+# PQC secrets are type Opaque with tls.crt / tls.key keys: kubectl create secret tls checks the key pair with
+# Go crypto, and Go releases before 1.27 cannot parse ML-DSA. Nothing is applied: output goes to stdout for review.
+
+set -euo pipefail
+EDGE_NS=pqc-edge
+DEPLOY=pqc-edge
+OUT=""
+ARGS=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -n) EDGE_NS=$2; shift 2 ;;
+        --deployment) DEPLOY=$2; shift 2 ;;
+        -o) OUT=$2; shift 2 ;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${ARGS[@]:-}"
+SUB=${1:-help}; shift || true
+
+need() { command -v "$1" >/dev/null || { echo "pqc-k8s: $1 not found" >&2; exit 2; }; }
+
+cert_summary() {   # PEM on stdin -> "ALG DAYSd" of the first certificate
+    local f; f=$(mktemp); cat > "$f"
+    local alg days end
+    alg=$(openssl x509 -in "$f" -noout -text 2>/dev/null | sed -n 's/^ *Public Key Algorithm: *//p' | head -n 1)
+    case "$alg" in
+        rsaEncryption) alg="RSA-$(openssl x509 -in "$f" -noout -text | sed -n 's/.*Public-Key: (\([0-9]*\) bit).*/\1/p' | head -n 1)" ;;
+        id-ecPublicKey) alg="EC-$(openssl x509 -in "$f" -noout -text | sed -n 's/^ *ASN1 OID: *//p' | head -n 1)" ;;
+        "") alg="unreadable" ;;
+    esac
+    end=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null | cut -d= -f2)
+    if [ -n "$end" ]; then days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 )); else days="?"; fi
+    rm -f "$f"
+    echo "$alg ${days}d"
+}
+
+cmd_inventory() {
+    need kubectl; need python3
+    echo "| Namespace | Workload | Image | Kind |"
+    echo "| --- | --- | --- | --- |"
+    kubectl get deploy,daemonset -A -o json | python3 -c '
+import json, sys, re
+pat = re.compile(r"ingress|controller|traefik|haproxy|envoy|contour|kong|istio|gateway|nginx|caddy|pqc-edge", re.I)
+for it in json.load(sys.stdin)["items"]:
+    imgs = [c["image"] for c in it["spec"]["template"]["spec"]["containers"]]
+    if any(pat.search(i) for i in imgs) or pat.search(it["metadata"]["name"]):
+        kind = "retired upstream (ingress-nginx, no fixes since 2026-03)" if any("ingress-nginx/controller" in i for i in imgs) else "-"
+        if any("pqc-web/edge" in i or "edge-nginx" in i or "edge-apache" in i for i in imgs): kind = "pqc edge"
+        print("| %s | %s/%s | %s | %s |" % (it["metadata"]["namespace"], it["kind"], it["metadata"]["name"], ", ".join(imgs), kind))
+'
+    echo
+    echo "| Namespace | Ingress | Class | Hosts | TLS secret | Certificate |"
+    echo "| --- | --- | --- | --- | --- | --- |"
+    kubectl get ingress -A -o json | python3 -c '
+import json, sys
+for it in json.load(sys.stdin)["items"]:
+    ns, name = it["metadata"]["namespace"], it["metadata"]["name"]
+    cls = it["spec"].get("ingressClassName") or it["metadata"].get("annotations", {}).get("kubernetes.io/ingress.class", "-")
+    tls = it["spec"].get("tls", [])
+    if not tls:
+        hosts = sorted({r.get("host", "*") for r in it["spec"].get("rules", [])})
+        print("\t".join([ns, name, cls, " ".join(hosts), "-"]))
+    for t in tls:
+        print("\t".join([ns, name, cls, " ".join(t.get("hosts", [])), t.get("secretName", "-")]))
+' | while IFS=$'\t' read -r ns name cls hosts secret; do
+        summ="-"
+        if [ "$secret" != "-" ]; then
+            summ=$(kubectl get secret -n "$ns" "$secret" -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d 2>/dev/null | cert_summary) || summ="missing"
+        fi
+        echo "| $ns | $name | $cls | $hosts | $secret | $summ |"
+    done
+    if kubectl get crd gateways.gateway.networking.k8s.io >/dev/null 2>&1; then
+        echo
+        echo "| Namespace | Gateway | Class | Listeners (port/protocol/hostname) |"
+        echo "| --- | --- | --- | --- |"
+        kubectl get gateways.gateway.networking.k8s.io -A -o json | python3 -c '
+import json, sys
+for g in json.load(sys.stdin)["items"]:
+    ls = ", ".join("%s/%s/%s" % (l.get("port"), l.get("protocol"), l.get("hostname", "*")) for l in g["spec"].get("listeners", []))
+    print("| %s | %s | %s | %s |" % (g["metadata"]["namespace"], g["metadata"]["name"], g["spec"].get("gatewayClassName"), ls))
+'
+    fi
+}
+
+cmd_plan() {
+    need kubectl; need python3
+    local out=/dev/stdout; [ -n "$OUT" ] && out=$OUT
+    kubectl get ingress -A -o json | python3 -c '
+import json, sys
+sites = {}
+for it in json.load(sys.stdin)["items"]:
+    ns = it["metadata"]["namespace"]
+    for t in it["spec"].get("tls", []):
+        hosts = [h.lower() for h in t.get("hosts", []) if h]
+        if not hosts or not t.get("secretName"):
+            continue
+        first = next((h for h in hosts if not h.startswith("*.")), None) or "wildcard." + hosts[0][2:]
+        key = (ns, t["secretName"])
+        cur = sites.setdefault(key, {"site": first, "hosts": []})
+        for h in hosts:
+            if h not in cur["hosts"]:
+                cur["hosts"].append(h)
+print("# site\tsecret-ns/secret\thosts (from Ingress TLS blocks; edit before use)")
+seen = set()
+for (ns, sec), v in sorted(sites.items()):
+    s = v["site"]
+    while s in seen:
+        s = s + "-" + ns
+    seen.add(s)
+    print("%s\t%s/%s\t%s" % (s, ns, sec, " ".join(v["hosts"])))
+' > "$out"
+    [ -n "$OUT" ] && echo "pqc-k8s: plan written to $OUT" >&2
+    return 0
+}
+
+plan_lines() { grep -v '^#' "$1" | sed '/^[[:space:]]*$/d'; }
+
+cmd_csr() {
+    local plan=${1:?plan.tsv} outdir=${2:?outdir}
+    echo "# run on the host that will keep the keys; sign each CSR on the CA host with pqc-ca sign"
+    plan_lines "$plan" | while IFS=$'\t' read -r site _ hosts; do
+        echo "pqc-ca key-csr $site $hosts --out $outdir"
+    done
+}
+
+b64() { base64 -w0 < "$1"; }
+
+cmd_secrets() {
+    need kubectl
+    local plan=${1:?plan.tsv} dir=${2:?pqc-dir}
+    plan_lines "$plan" | while IFS=$'\t' read -r site src _; do
+        local c="$dir/$site/fullchain.pem" k="$dir/$site/privkey.pem"
+        [ -f "$c" ] && [ -f "$k" ] || { echo "pqc-k8s: $c or $k missing, site $site skipped" >&2; continue; }
+        openssl x509 -in "$c" -noout -text | grep -q 'Public Key Algorithm: ML-DSA' \
+            || { echo "pqc-k8s: $c is not ML-DSA, site $site skipped" >&2; continue; }
+        cat <<EOF
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $site-pqc
+  namespace: $EDGE_NS
+  labels: {app.kubernetes.io/part-of: pqc-edge, pqc.thereminq/site: "$site", pqc.thereminq/half: pqc}
+type: Opaque
+data:
+  tls.crt: $(b64 "$c")
+  tls.key: $(b64 "$k")
+EOF
+        local sns=${src%%/*} sname=${src#*/} crt key
+        crt=$(kubectl get secret -n "$sns" "$sname" -o jsonpath='{.data.tls\.crt}' 2>/dev/null || true)
+        key=$(kubectl get secret -n "$sns" "$sname" -o jsonpath='{.data.tls\.key}' 2>/dev/null || true)
+        if [ -z "$crt" ] || [ -z "$key" ]; then
+            echo "pqc-k8s: classic secret $src not readable, site $site will serve the ML-DSA chain only" >&2
+            continue
+        fi
+        cat <<EOF
+---
+# copy of $src; re-run after every renewal, or issue it in $EDGE_NS with cert-manager instead
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $site-classic
+  namespace: $EDGE_NS
+  labels: {app.kubernetes.io/part-of: pqc-edge, pqc.thereminq/site: "$site", pqc.thereminq/half: classic}
+type: kubernetes.io/tls
+data:
+  tls.crt: $crt
+  tls.key: $key
+EOF
+    done
+}
+
+cmd_sites_patch() {
+    local plan=${1:?plan.tsv}
+    cat <<EOF
+# Deployment patch: mounts every planned site into /etc/pqc/sites/<site>/{pqc,classic}/tls.{crt,key}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $DEPLOY
+  namespace: $EDGE_NS
+spec:
+  template:
+    spec:
+      volumes:
+        - name: sites
+          projected:
+            defaultMode: 0440
+            sources:
+EOF
+    plan_lines "$plan" | while IFS=$'\t' read -r site _ _; do
+        cat <<EOF
+              - secret:
+                  name: $site-pqc
+                  items: [{key: tls.crt, path: $site/pqc/tls.crt}, {key: tls.key, path: $site/pqc/tls.key}]
+              - secret:
+                  name: $site-classic
+                  optional: true
+                  items: [{key: tls.crt, path: $site/classic/tls.crt}, {key: tls.key, path: $site/classic/tls.key}]
+EOF
+    done
+}
+
+case "$SUB" in
+    inventory) cmd_inventory ;;
+    plan) cmd_plan ;;
+    csr) cmd_csr "$@" ;;
+    secrets) cmd_secrets "$@" ;;
+    sites-patch) cmd_sites_patch "$@" ;;
+    help|*) sed -n '2,16p' "$0" ;;
+esac

@@ -1,3 +1,6 @@
+<img width="2752" height="1536" alt="12343" src="https://github.com/user-attachments/assets/24698239-8c62-40bc-9cb3-d254c5fd7048" />
+
+
 # PQC web ingress migration (`pqc-wallfacer/web-ingress`)
 
 Emergency migration kit for existing websites under the assumption that RSA and ECC certificate authorities are no longer trustworthy (CA keys forgeable). It adds a post-quantum certificate chain next to the existing classical one, on nginx and Apache httpd, on plain hosts, in containers and in front of Kubernetes ingress, and evaluates the result from the client side.

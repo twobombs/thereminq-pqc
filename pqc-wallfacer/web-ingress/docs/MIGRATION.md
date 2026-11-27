@@ -158,7 +158,7 @@ The edge reads server names from the certificates, re-renders and reloads when f
 
 | Move | Precondition | Check |
 | --- | --- | --- |
-| `compat` to `pqc-first` | Every client that offers ML-DSA has the root (OpenSSL 3.5 tooling, Go 1.27+, browsers with ML-DSA support) | `pqc-eval` `default_client_gets=ML-DSA-*`; client error rates flat |
+| `compat` to `pqc-first` | Every client that offers ML-DSA has the root: OpenSSL 3.5 tooling, Go 1.27+, and every Chromium (156 offers ML-DSA first) | `pqc-eval` `default_client_gets=ML-DSA-*`; client error rates flat |
 | to `pqc-only` | Every client is PQC-capable and has the root | `pqc-eval` `L3 PQC-ONLY`, `classical_kex_accepted=no` |
 | Monitoring | Any | `pqc-eval --require L2 -f targets.txt` in a cron or CI job; log `$ssl_curve` (nginx) to measure hybrid share |
 

@@ -7,10 +7,10 @@ The ML-DSA chain only protects clients that verify it. This page covers root dis
 | Client offers | `compat` | `pqc-first` | `pqc-only` |
 | --- | --- | --- | --- |
 | Classical signature algorithms only (most browsers, OpenSSL < 3.5, older Go, Java) | classical | classical | handshake fails |
-| Classical + ML-DSA (OpenSSL 3.5 defaults: curl, Python, wget, git on Debian 13) | classical | ML-DSA | ML-DSA |
+| Classical + ML-DSA (Chromium 156; OpenSSL 3.5 defaults: curl, Python, wget, git on Debian 13) | classical | ML-DSA | ML-DSA |
 | ML-DSA only (`client-pqc-strict.cnf`, `curl --sigalgs mldsa65:mldsa87:mldsa44`) | ML-DSA | ML-DSA | ML-DSA |
 
-A client that receives the ML-DSA chain without having the root fails verification. In `pqc-first` this hits every OpenSSL 3.5 client that lacks the root, which is why `pqc-first` waits for distribution.
+A client that receives the ML-DSA chain without having the root fails verification; Chromium does not fall back to the classical chain. In `pqc-first` this hits every Chromium and every OpenSSL 3.5 client that lacks the root, which is why `pqc-first` waits for distribution.
 
 ## Client support
 
@@ -18,7 +18,7 @@ A client that receives the ML-DSA chain without having the root fails verificati
 | --- | --- | --- | --- |
 | OpenSSL 3.5+ (curl, Python, wget, git, PHP, Ruby linked to it) | default | yes | Debian 13: OpenSSL 3.5. Ubuntu 24.04: OpenSSL 3.0 (no ML-DSA) |
 | Go 1.27+ | default since 1.24 | yes (`crypto/mldsa`, `crypto/tls`) | Earlier Go cannot parse ML-DSA certificates |
-| Chrome / Chromium | default since 131 (desktop) | reported for user-added private roots from mid 2026 | No ML-DSA in the public root store; verify on your build |
+| Chromium 156 (Linux, tested) | X25519MLKEM768 | yes, with the root from the `CACertificates` policy; `pqc-only` loads | Offers mldsa44/65/87 before ECDSA/RSA. No ML-DSA in the public root store |
 | Firefox, Safari, Edge | hybrid key exchange shipped | verify per version | Test with the root installed before relying on it |
 | Java | depends on version and provider | verify per version | |
 
@@ -35,7 +35,14 @@ Get `pqc-web-root.pem` and its `FINGERPRINTS` from `pqc-ca trust`; compare the S
 | Container images | Same as the base distribution, in the Dockerfile |
 | Single program | `curl --cacert pqc-web-root.pem`, `SSL_CERT_FILE=...`, `REQUESTS_CA_BUNDLE=...` |
 | Kubernetes workloads | ConfigMap with the root, mounted and pointed to by `SSL_CERT_FILE` |
-| Managed browsers | Enterprise policy for user-added roots |
+| Chrome / Chromium | Policy `CACertificates`: list of base64 DER certificates, e.g. `/etc/chromium/policies/managed/pqc.json` (Linux), GPO / MDM elsewhere. NSS `certutil` cannot import ML-DSA roots |
+
+```sh
+# Chromium on Linux
+mkdir -p /etc/chromium/policies/managed
+printf '{"CACertificates": ["%s"]}\n' "$(openssl x509 -in pqc-web-root.pem -outform DER | base64 -w0)" \
+  > /etc/chromium/policies/managed/pqc.json      # Google Chrome: /etc/opt/chrome/policies/managed/
+```
 
 A system store that only OpenSSL < 3.5 reads gains nothing: those clients cannot verify ML-DSA and keep getting the classical chain.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-tests.sh: builds the three images and runs every test suite. Needs Docker; nothing is pushed.
 #   tests/run-tests.sh            all suites
-#   tests/run-tests.sh webconf    one suite: webconf | edge | k8s
+#   tests/run-tests.sh webconf    one suite: webconf | edge | chromium | k8s
 set -uo pipefail
 KIT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$KIT"
@@ -15,6 +15,8 @@ for i in nginx apache tools; do
     docker build -q --build-arg DEBIAN_IMAGE="$DEBIAN_IMAGE" -f docker/$i/Dockerfile -t $tag . >/dev/null \
         && echo "  ok   $tag" || { echo "  FAIL build $tag"; exit 1; }
 done
+docker build -q -t pqc-web/chromium -f tests/Dockerfile.chromium tests >/dev/null \
+    && echo "  ok   pqc-web/chromium" || { echo "  FAIL build chromium"; exit 1; }
 docker build -q --build-arg DEBIAN_IMAGE="$DEBIAN_IMAGE" -t pqc-web/testbed -f tests/Dockerfile.testbed tests >/dev/null \
     && echo "  ok   pqc-web/testbed" || { echo "  FAIL build testbed"; exit 1; }
 
@@ -25,6 +27,10 @@ fi
 if [ "$only" = all ] || [ "$only" = edge ]; then
     echo "== edge images"
     bash tests/edge-e2e.sh || rc=1
+fi
+if [ "$only" = all ] || [ "$only" = chromium ]; then
+    echo "== Chromium against the edge images"
+    bash tests/chromium-e2e.sh || rc=1
 fi
 if [ "$only" = all ] || [ "$only" = k8s ]; then
     echo "== pqc-k8s (stub kubectl) and manifests"

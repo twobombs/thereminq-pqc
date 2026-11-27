@@ -1,0 +1,312 @@
+#!/bin/sh
+# pqc-ca: private ML-DSA PKI for web server certificates (OpenSSL 3.5+).
+#
+# The classical WebPKI is presumed broken (RSA/ECC CA keys forgeable). This CA issues the PQC half of a
+# dual certificate stack: an ML-DSA chain served next to the existing classical chain, trusted by clients
+# that have the root installed. Same discipline as Wallfacer wf-ca: offline root, issuing intermediate,
+# short leaves, keys generated where they are used.
+#
+# Layout under $PQC_CA_DIR (default ./pqc-ca):
+#   root/   root.key root.crt                         offline ML-DSA-87 root
+#   int/    int.key int.crt ca.cnf index.txt ...      issuing intermediate, optional DNS name constraints
+#   trust/  pqc-web-root.pem FINGERPRINTS             what clients install
+#
+# Leaf output directory (one per site): privkey.pem csr.pem cert.pem chain.pem fullchain.pem
+# fullchain.pem = leaf + intermediate (the root is never sent on the wire).
+
+set -eu
+umask 077
+
+CA=${PQC_CA_DIR:-./pqc-ca}
+CA_ALG=${PQC_CA_ALG:-ML-DSA-87}
+LEAF_ALG=${PQC_LEAF_ALG:-ML-DSA-65}
+LEAF_DAYS=${PQC_LEAF_DAYS:-30}
+LEAF_MAX_DAYS=${PQC_LEAF_MAX_DAYS:-90}
+ROOT_DAYS=${PQC_ROOT_DAYS:-3650}
+INT_DAYS=${PQC_INT_DAYS:-730}
+
+die() { echo "pqc-ca: $*" >&2; exit 1; }
+note() { echo "pqc-ca: $*" >&2; }
+
+need_openssl() {
+    v=$(openssl version | awk '{print $2}')
+    major=${v%%.*}; rest=${v#*.}; minor=${rest%%.*}
+    { [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 5 ]; }; } \
+        || die "OpenSSL $v found, 3.5 or newer required (use the pqc-web-tools image)"
+}
+
+check_alg() {   # alg
+    case "$1" in ML-DSA-44|ML-DSA-65|ML-DSA-87) ;; *) die "algorithm '$1' not allowed (ML-DSA-44|65|87)";; esac
+}
+
+key_alg() {   # file -in|-pubin|-req|-x509
+    case "$2" in
+        -req)  openssl req -in "$1" -noout -text 2>/dev/null ;;
+        -x509) openssl x509 -in "$1" -noout -text 2>/dev/null ;;
+        -pubin) openssl pkey -pubin -in "$1" -noout -text 2>/dev/null ;;
+        *)     openssl pkey -in "$1" -noout -text 2>/dev/null ;;
+    esac | grep -E 'Public Key Algorithm|^ML-DSA-' | grep -o 'ML-DSA-[0-9][0-9]' | head -n 1
+}
+
+rand_serial() { echo "0x$(openssl rand -hex 16)"; }
+
+valid_dns() {   # name
+    printf '%s' "$1" | grep -Eq '^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9-]{2,63}$|^localhost$'
+}
+
+valid_site() {
+    case "$1" in ''|*[!A-Za-z0-9._-]*) die "site name may only contain A-Z a-z 0-9 . _ -";; esac
+}
+
+# ------------------------------------------------------------------ root / intermediate
+
+cmd_init_root() {   # CN
+    cn=${1:?usage: pqc-ca init-root <CN>}
+    need_openssl; check_alg "$CA_ALG"
+    d="$CA/root"; [ -e "$d/root.key" ] && die "root already exists in $d"
+    mkdir -p "$d" "$CA/trust"
+    openssl genpkey -algorithm "$CA_ALG" -out "$d/root.key"
+    openssl req -x509 -new -key "$d/root.key" -subj "/CN=$cn" -days "$ROOT_DAYS" \
+        -set_serial "$(rand_serial)" \
+        -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -out "$d/root.crt"
+    cmd_trust >/dev/null
+    note "root created: $d/root.crt ($CA_ALG, $ROOT_DAYS days)"
+    note "after init-int, move $d/root.key to offline storage"
+}
+
+cmd_init_int() {   # CN [--permit-dns a.example,b.example]
+    cn=""; permit=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --permit-dns) permit=${2:?}; shift 2 ;;
+            -*) die "unknown option $1" ;;
+            *) cn=$1; shift ;;
+        esac
+    done
+    [ -n "$cn" ] || die "usage: pqc-ca init-int <CN> [--permit-dns example.com,example.org]"
+    need_openssl; check_alg "$CA_ALG"
+    [ -f "$CA/root/root.key" ] || die "needs $CA/root/root.key (run on the offline root host)"
+    d="$CA/int"; [ -e "$d/int.key" ] && die "intermediate already exists in $d"
+    mkdir -p "$d/certs"
+    : > "$d/index.txt"
+    openssl rand -hex 16 > "$d/serial"
+    echo 1000 > "$d/crlnumber"
+    openssl genpkey -algorithm "$CA_ALG" -out "$d/int.key"
+    openssl req -new -key "$d/int.key" -subj "/CN=$cn" -out "$d/int.csr"
+    ext=$(mktemp)
+    {
+        echo "basicConstraints=critical,CA:TRUE,pathlen:0"
+        echo "keyUsage=critical,keyCertSign,cRLSign"
+        echo "extendedKeyUsage=serverAuth"
+        echo "subjectKeyIdentifier=hash"
+        echo "authorityKeyIdentifier=keyid"
+        if [ -n "$permit" ]; then
+            nc=""
+            for n in $(echo "$permit" | tr ',' ' '); do
+                printf '%s' "$n" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || die "bad --permit-dns entry '$n'"
+                nc="${nc:+$nc,}permitted;DNS:$n"
+            done
+            echo "nameConstraints=critical,$nc"
+        fi
+    } > "$ext"
+    openssl x509 -req -in "$d/int.csr" -CA "$CA/root/root.crt" -CAkey "$CA/root/root.key" \
+        -set_serial "$(rand_serial)" -days "$INT_DAYS" -extfile "$ext" -out "$d/int.crt"
+    rm -f "$ext" "$d/int.csr"
+    [ -n "$permit" ] && echo "$permit" > "$d/PERMITTED_DNS"
+    cat > "$d/ca.cnf" <<EOF
+[ ca ]
+default_ca = pqc_web
+
+[ pqc_web ]
+dir              = $d
+database         = \$dir/index.txt
+new_certs_dir    = \$dir/certs
+certificate      = \$dir/int.crt
+private_key      = \$dir/int.key
+serial           = \$dir/serial
+crlnumber        = \$dir/crlnumber
+default_md       = default
+default_days     = $LEAF_DAYS
+default_crl_days = 7
+policy           = pqc_policy
+unique_subject   = no
+copy_extensions  = none
+
+[ pqc_policy ]
+commonName = optional
+EOF
+    note "intermediate created: $d/int.crt (${permit:+name constraints: $permit, }$INT_DAYS days)"
+}
+
+# ------------------------------------------------------------------ leaves
+
+cmd_key_csr() {   # site dns... [--out dir]
+    out="."; site=""; names=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --out) out=${2:?}; shift 2 ;;
+            -*) die "unknown option $1" ;;
+            *) if [ -z "$site" ]; then site=$1; else names="$names $1"; fi; shift ;;
+        esac
+    done
+    [ -n "$site" ] && [ -n "$names" ] || die "usage: pqc-ca key-csr <site> <dns> [dns...] [--out dir]"
+    valid_site "$site"; need_openssl; check_alg "$LEAF_ALG"
+    san=""
+    for n in $names; do
+        valid_dns "$n" || die "invalid DNS name '$n'"
+        san="${san:+$san,}DNS:$n"
+    done
+    d="$out/$site"; mkdir -p "$d"
+    [ -e "$d/privkey.pem" ] && die "$d/privkey.pem exists; move it away to rotate"
+    first=$(echo $names | awk '{print $1}')
+    openssl genpkey -algorithm "$LEAF_ALG" -out "$d/privkey.pem"
+    openssl req -new -key "$d/privkey.pem" -subj "/CN=$first" -addext "subjectAltName=$san" -out "$d/csr.pem"
+    chmod 0600 "$d/privkey.pem"; chmod 0644 "$d/csr.pem"
+    note "key + CSR: $d/privkey.pem $d/csr.pem ($LEAF_ALG, $san)"
+}
+
+csr_dns_names() {   # csr -> one name per line
+    openssl req -in "$1" -noout -text 2>/dev/null \
+        | awk '/X509v3 Subject Alternative Name/{getline; print; exit}' \
+        | tr ',' '\n' | sed -n 's/^ *DNS://p'
+}
+
+dns_permitted() {   # name -> 0 if allowed by PERMITTED_DNS (or none set)
+    f="$CA/int/PERMITTED_DNS"
+    [ -f "$f" ] || return 0
+    n=${1#\*.}
+    for p in $(tr ',' ' ' < "$f"); do
+        case "$n" in "$p"|*".$p") return 0 ;; esac
+    done
+    return 1
+}
+
+cmd_sign() {   # csr outdir [--days N]
+    days=$LEAF_DAYS; csr=""; outd=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --days) days=${2:?}; shift 2 ;;
+            -*) die "unknown option $1" ;;
+            *) if [ -z "$csr" ]; then csr=$1; else outd=$1; fi; shift ;;
+        esac
+    done
+    [ -n "$csr" ] && [ -n "$outd" ] || die "usage: pqc-ca sign <csr.pem> <outdir> [--days N]"
+    need_openssl
+    [ -f "$CA/int/ca.cnf" ] || die "no intermediate in $CA/int; run init-int first"
+    [ "$days" -ge 1 ] && [ "$days" -le "$LEAF_MAX_DAYS" ] || die "leaf lifetime must be 1..$LEAF_MAX_DAYS days"
+    openssl req -in "$csr" -verify -noout >/dev/null 2>&1 || die "CSR self-signature invalid"
+    alg=$(key_alg "$csr" -req); [ -n "$alg" ] || die "CSR key is not ML-DSA (classical keys are not issued)"
+    names=$(csr_dns_names "$csr"); [ -n "$names" ] || die "CSR carries no DNS subjectAltName"
+    san=""
+    for n in $names; do
+        valid_dns "$n" || die "CSR SAN '$n' is not a valid DNS name"
+        dns_permitted "$n" || die "CSR SAN '$n' is outside the intermediate's name constraints"
+        san="${san:+$san,}DNS:$n"
+    done
+    mkdir -p "$outd"
+    ext=$(mktemp)
+    cat > "$ext" <<EOF
+[ leaf ]
+basicConstraints       = critical,CA:FALSE
+keyUsage               = critical,digitalSignature
+extendedKeyUsage       = serverAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid
+subjectAltName         = $san
+EOF
+    openssl ca -batch -config "$CA/int/ca.cnf" -extfile "$ext" -extensions leaf -days "$days" \
+        -in "$csr" -out "$outd/cert.pem" -notext 2>"$ext.log" \
+        || { cat "$ext.log" >&2; rm -f "$ext" "$ext.log"; die "signing failed"; }
+    rm -f "$ext" "$ext.log"
+    cp "$CA/int/int.crt" "$outd/chain.pem"
+    cat "$outd/cert.pem" "$outd/chain.pem" > "$outd/fullchain.pem"
+    chmod 0644 "$outd/cert.pem" "$outd/chain.pem" "$outd/fullchain.pem"
+    openssl verify -CAfile "$CA/root/root.crt" -untrusted "$CA/int/int.crt" "$outd/cert.pem" >/dev/null \
+        || die "issued certificate does not verify against the chain"
+    note "issued $outd/fullchain.pem ($alg, $days days, $san)"
+}
+
+cmd_issue() {   # site dns... [--out dir] [--days N]   (key, CSR and cert in one step; lab or CA-host use)
+    out="."; days=$LEAF_DAYS; args=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --out) out=${2:?}; shift 2 ;;
+            --days) days=${2:?}; shift 2 ;;
+            *) args="$args $1"; shift ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    cmd_key_csr $args --out "$out"
+    site=$(echo $args | awk '{print $1}')
+    cmd_sign "$out/$site/csr.pem" "$out/$site" --days "$days"
+}
+
+cmd_revoke() {   # cert
+    crt=${1:?usage: pqc-ca revoke <cert.pem>}
+    openssl ca -config "$CA/int/ca.cnf" -revoke "$crt"
+    cmd_crl
+}
+
+cmd_crl() {
+    openssl ca -config "$CA/int/ca.cnf" -gencrl -out "$CA/int/crl.pem"
+    note "CRL: $CA/int/crl.pem (publish to clients that check revocation)"
+}
+
+cmd_trust() {   # prints the root to install on clients, with fingerprints for out-of-band checking
+    [ -f "$CA/root/root.crt" ] || die "no root in $CA/root"
+    mkdir -p "$CA/trust"
+    cp "$CA/root/root.crt" "$CA/trust/pqc-web-root.pem"
+    chmod 0644 "$CA/trust/pqc-web-root.pem"
+    {
+        echo "subject  $(openssl x509 -in "$CA/root/root.crt" -noout -subject | sed 's/^subject=//')"
+        echo "alg      $(key_alg "$CA/root/root.crt" -x509)"
+        echo "notAfter $(openssl x509 -in "$CA/root/root.crt" -noout -enddate | cut -d= -f2)"
+        echo "SHA-256  $(openssl x509 -in "$CA/root/root.crt" -noout -fingerprint -sha256 | cut -d= -f2)  (DER, browser / openssl x509 -fingerprint)"
+        echo "SHA3-256 $(openssl dgst -sha3-256 -r "$CA/trust/pqc-web-root.pem" | cut -d' ' -f1 | tr a-f A-F)  (pqc-web-root.pem file, same as wf-ca fingerprint / wf-keyroll)"
+    } > "$CA/trust/FINGERPRINTS"
+    chmod 0644 "$CA/trust/FINGERPRINTS"
+    cat "$CA/trust/FINGERPRINTS"
+    note "install $CA/trust/pqc-web-root.pem on clients; read the SHA3-256 out of band (paper QR: wf-keyroll)"
+}
+
+cmd_show() {   # cert
+    c=${1:?usage: pqc-ca show <cert.pem>}
+    openssl x509 -in "$c" -noout -subject -issuer -enddate -ext subjectAltName,nameConstraints 2>/dev/null
+    echo "key: $(key_alg "$c" -x509)  der-bytes: $(openssl x509 -in "$c" -outform DER | wc -c)"
+}
+
+cmd_help() {
+    cat <<'EOF'
+pqc-ca: private ML-DSA PKI for the PQC half of a dual certificate stack
+
+  init-root <CN>                                 offline root (PQC_CA_ALG, default ML-DSA-87)
+  init-int <CN> [--permit-dns a.com,b.org]       issuing intermediate, DNS name constraints recommended
+  key-csr <site> <dns>... [--out dir]            on the web host: key + CSR (PQC_LEAF_ALG, default ML-DSA-65)
+  sign <csr.pem> <outdir> [--days N]             on the CA host: leaf, chain.pem, fullchain.pem
+  issue <site> <dns>... [--out dir] [--days N]   key-csr + sign in one step
+  revoke <cert.pem> | crl                        revocation list
+  trust                                          root for client install + fingerprints
+  show <cert.pem>                                subject, SAN, algorithm, size
+
+Environment: PQC_CA_DIR (./pqc-ca) PQC_CA_ALG PQC_LEAF_ALG PQC_LEAF_DAYS (30) PQC_LEAF_MAX_DAYS (90)
+             PQC_ROOT_DAYS (3650) PQC_INT_DAYS (730)
+EOF
+}
+
+sub=${1:-help}; [ "$#" -gt 0 ] && shift
+case "$sub" in
+    init-root) cmd_init_root "$@" ;;
+    init-int)  cmd_init_int "$@" ;;
+    key-csr)   cmd_key_csr "$@" ;;
+    sign)      cmd_sign "$@" ;;
+    issue)     cmd_issue "$@" ;;
+    revoke)    cmd_revoke "$@" ;;
+    crl)       cmd_crl ;;
+    trust)     cmd_trust ;;
+    show)      cmd_show "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) cmd_help >&2; exit 2 ;;
+esac

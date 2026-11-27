@@ -1,0 +1,21 @@
+# OpenSSL 3.5 client profile: require post-quantum authentication and hybrid key exchange.
+#
+#   OPENSSL_CONF=/path/client-pqc-strict.cnf curl --cacert pqc-web-root.pem https://site.example/
+#   OPENSSL_CONF=/path/client-pqc-strict.cnf python3 app.py      (ssl.create_default_context(cafile=...))
+#
+# Every program that uses the default libssl context picks this up (curl, wget, git, Python, Ruby, PHP).
+# Offering only ML-DSA makes dual-stack servers in any profile send the ML-DSA chain. Combined with a trust
+# store holding only the PQC root, a forged classical certificate cannot be accepted (no downgrade).
+
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+MinProtocol = TLSv1.3
+Groups = X25519MLKEM768:SecP256r1MLKEM768:SecP384r1MLKEM1024
+SignatureAlgorithms = mldsa65:mldsa87:mldsa44

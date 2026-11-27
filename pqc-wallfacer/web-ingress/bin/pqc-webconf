@@ -1,0 +1,1131 @@
+#!/usr/bin/env python3
+"""pqc-webconf: inventory and migrate nginx / Apache httpd TLS sites to a dual certificate stack.
+
+  pqc-webconf inventory --server nginx|apache [--conf FILE] [--format table|json] [--emit-csr DIR]
+  pqc-webconf migrate   --server nginx|apache --profile compat|pqc-first|pqc-only --cert-root DIR
+                        [--conf FILE] [--only SITE,...] [--exclude SITE,...] [--site-map FILE]
+                        [--apply] [--reload] [--test-cmd CMD] [--reload-cmd CMD] [--backup-root DIR]
+  pqc-webconf remove    --server nginx|apache [--conf FILE] [--apply] [--reload] ...
+  pqc-webconf rollback  <backup-dir> [--force] [--test-cmd CMD] [--reload] [--reload-cmd CMD]
+
+Migration adds a managed block to every TLS server / VirtualHost:
+  * the ML-DSA certificate pair next to the existing classical pair(s)
+  * ssl_conf_command / SSLOpenSSLConfCmd lines for MinProtocol, ServerPreference, Groups and
+    SignatureAlgorithms from profiles/profiles.env. Both servers apply these after their own TLS
+    directives, so existing ssl_protocols / SSLProtocol (including shared snippets) are overridden
+    without duplicate-directive errors.
+
+Dry run is the default. --apply writes files atomically, keeps a backup, runs the config test and
+restores the backup automatically if the test fails. Stdlib only; needs openssl >= 3.5 in PATH to
+inspect ML-DSA certificates.
+"""
+
+import argparse
+import ctypes
+import datetime as dt
+import difflib
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+PROFILES_FILE = os.environ.get("PQC_PROFILES_FILE", os.path.join(HERE, "..", "profiles", "profiles.env"))
+
+BEGIN = "# >>> pqc-webconf"
+END = "# <<< pqc-webconf <<<"
+DISABLED = "#pqc-webconf# "
+
+MLDSA_OIDS = {
+    "2.16.840.1.101.3.4.3.17": "ML-DSA-44",
+    "2.16.840.1.101.3.4.3.18": "ML-DSA-65",
+    "2.16.840.1.101.3.4.3.19": "ML-DSA-87",
+}
+# ssl_conf_command names whose value pqc-webconf sets. "Options" is cumulative in OpenSSL, so inherited
+# Options lines are kept next to ours.
+CONF_CMDS_OWNED = {"minprotocol", "groups", "curves", "signaturealgorithms", "sigalgs"}
+
+
+def die(msg, code=1):
+    print(f"pqc-webconf: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(f"pqc-webconf: {msg}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- profiles
+
+def load_profiles():
+    kv = {}
+    with open(PROFILES_FILE) as f:
+        for line in f:
+            m = re.match(r'^([A-Za-z0-9_-]+)="(.*)"\s*$', line)
+            if m:
+                kv[m.group(1)] = m.group(2)
+
+    def expand(spec, prefix):
+        return ":".join(kv[f"{prefix}_{p}"] for p in spec.split(":"))
+
+    profiles = {}
+    for name in ("compat", "pqc-first", "pqc-only"):
+        protos = kv[f"{name}_PROTOCOLS"].split()
+        profiles[name] = {
+            "name": name,
+            "min_protocol": sorted(protos)[0],
+            "groups": expand(kv[f"{name}_GROUPS"], "PQC_GROUPS"),
+            "sigalgs": expand(kv[f"{name}_SIGALGS"], "PQC_SIGALGS"),
+            "classic_cert": kv[f"{name}_CLASSIC_CERT"] == "yes",
+        }
+    return profiles
+
+
+# --------------------------------------------------------------------------- openssl helpers
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw)
+
+
+def openssl_version():
+    try:
+        out = run(["openssl", "version"]).stdout.split()
+        return out[1] if len(out) > 1 else "?"
+    except FileNotFoundError:
+        return None
+
+
+def version_ge(v, want=(3, 5)):
+    m = re.match(r"(\d+)\.(\d+)", v or "")
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= want
+
+
+_cert_cache = {}
+
+
+def cert_info(path):
+    """Algorithm, SANs, expiry of the first certificate in path. Works for ML-DSA with OpenSSL >= 3.5,
+    and reports the ML-DSA OID name on older OpenSSL."""
+    if path in _cert_cache:
+        return _cert_cache[path]
+    info = {"path": path, "exists": os.path.isfile(path), "alg": "?", "days": None, "san": [], "issuer": "", "subject": ""}
+    if info["exists"]:
+        r = run(["openssl", "x509", "-in", path, "-noout", "-text", "-nameopt", "oneline"])
+        t = r.stdout
+        m = re.search(r"Public Key Algorithm:\s*(\S+)", t)
+        alg = m.group(1) if m else "?"
+        alg = MLDSA_OIDS.get(alg, alg)
+        if alg == "rsaEncryption":
+            b = re.search(r"Public-Key: \((\d+) bit\)", t)
+            alg = f"RSA-{b.group(1) if b else '?'}"
+        elif alg == "id-ecPublicKey":
+            c = re.search(r"(?:NIST CURVE|ASN1 OID):\s*(\S+)", t)
+            alg = f"EC-{c.group(1) if c else '?'}"
+        info["alg"] = alg
+        san = re.search(r"X509v3 Subject Alternative Name:.*?\n\s*(.+)", t)
+        if san:
+            info["san"] = [s.strip()[4:] for s in san.group(1).split(",") if s.strip().startswith("DNS:")]
+        iss = re.search(r"Issuer:\s*(.+)", t)
+        info["issuer"] = iss.group(1).strip() if iss else ""
+        sub = re.search(r"Subject:\s*(.+)", t)
+        info["subject"] = sub.group(1).strip() if sub else ""
+        e = run(["openssl", "x509", "-in", path, "-noout", "-enddate"]).stdout.strip()
+        if e.startswith("notAfter="):
+            try:
+                end = dt.datetime.strptime(e[9:].replace("  ", " "), "%b %d %H:%M:%S %Y %Z").replace(tzinfo=dt.timezone.utc)
+                info["days"] = (end - dt.datetime.now(dt.timezone.utc)).days
+            except ValueError:
+                pass
+    _cert_cache[path] = info
+    return info
+
+
+def key_matches(cert, key):
+    a = run(["openssl", "x509", "-in", cert, "-noout", "-pubkey"]).stdout
+    b = run(["openssl", "pkey", "-in", key, "-pubout"]).stdout
+    return bool(a) and a == b
+
+
+def name_covered(name, sans):
+    name = name.lower()
+    for s in sans:
+        s = s.lower()
+        if s == name:
+            return True
+        if s.startswith("*.") and "." in name and name.split(".", 1)[1] == s[2:]:
+            return True
+    return False
+
+
+def is_pqc_alg(alg):
+    return alg.startswith("ML-DSA") or alg.startswith("SLH-DSA")
+
+
+def linked_libssl_version(module_path):
+    """OpenSSL version string of the libssl a shared object links against (Apache mod_ssl)."""
+    try:
+        out = run(["ldd", module_path]).stdout
+    except FileNotFoundError:
+        return None
+    m = re.search(r"libssl\.so[.\d]*\s*=>\s*(\S+)", out)
+    if not m:
+        return None
+    try:
+        lib = ctypes.CDLL(m.group(1))
+        f = lib.OpenSSL_version
+        f.restype = ctypes.c_char_p
+        f.argtypes = [ctypes.c_int]
+        return f(0).decode()
+    except (OSError, AttributeError):
+        return None
+
+
+# --------------------------------------------------------------------------- site naming
+
+def site_name(names, port):
+    for n in names:
+        if n and n != "_" and not n.startswith("~") and "*" not in n and not n.startswith("."):
+            return n.lower()
+    for n in names:
+        if n.startswith("*."):
+            return "wildcard." + n[2:].lower()
+        if n.startswith(".") and len(n) > 1:
+            return "wildcard." + n[1:].lower()
+    return f"default-{port}"
+
+
+def cert_names(names):
+    """server_name / ServerAlias values that belong in a certificate."""
+    out = []
+    for n in names:
+        if not n or n == "_" or n.startswith("~"):
+            continue
+        if n.startswith(".") and len(n) > 1:
+            out += [n[1:], "*" + n]
+        elif "*" in n and not n.startswith("*."):
+            continue
+        else:
+            out.append(n)
+    seen, res = set(), []
+    for n in out:
+        if n.lower() not in seen:
+            seen.add(n.lower())
+            res.append(n.lower())
+    return res
+
+
+# --------------------------------------------------------------------------- nginx parser
+
+class NgxNode:
+    __slots__ = ("name", "args", "start", "end", "line", "children", "open_pos", "close_pos", "file", "included")
+
+    def __init__(self, name, args, start, line, file):
+        self.name, self.args, self.start, self.line, self.file = name, args, start, line, file
+        self.end = None
+        self.children = None
+        self.open_pos = self.close_pos = None
+        self.included = []   # list of (file, [nodes]) for include directives
+
+
+def ngx_tokens(text):
+    i, n, line = 0, len(text), 1
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c in " \t\r":
+            i += 1
+            continue
+        if c == "#":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c in "{};":
+            yield (c, c, i, i + 1, line)
+            i += 1
+            continue
+        if c in "\"'":
+            j, buf, start, sline = i + 1, [], i, line
+            while j < n and text[j] != c:
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j + 1])
+                    j += 2
+                    continue
+                if text[j] == "\n":
+                    line += 1
+                buf.append(text[j])
+                j += 1
+            if j >= n:
+                raise ValueError(f"unterminated quote at line {sline}")
+            yield ("word", "".join(buf), start, j + 1, sline)
+            i = j + 1
+            continue
+        j = i
+        while j < n:
+            c = text[j]
+            if c == "{" and j > i and text[j - 1] == "$":
+                k = text.find("}", j)
+                if k < 0:
+                    raise ValueError(f"unterminated ${{ at line {line}")
+                j = k + 1
+                continue
+            if c in " \t\r\n;{}":
+                break
+            if c == "\\" and j + 1 < n:
+                j += 2
+                continue
+            j += 1
+        yield ("word", text[i:j], i, j, line)
+        i = j
+
+
+def ngx_parse(text, file):
+    root = []
+    stack = [root]
+    nodes_stack = []
+    words, start, sline = [], None, None
+    for kind, val, s, e, line in ngx_tokens(text):
+        if kind == "word":
+            if not words:
+                start, sline = s, line
+            words.append(val)
+        elif kind == ";":
+            if not words:
+                continue
+            node = NgxNode(words[0], words[1:], start, sline, file)
+            node.end = e
+            stack[-1].append(node)
+            words = []
+        elif kind == "{":
+            if not words:
+                raise ValueError(f"{file}:{line}: block without a name")
+            node = NgxNode(words[0], words[1:], start, sline, file)
+            node.children = []
+            node.open_pos = s
+            stack[-1].append(node)
+            stack.append(node.children)
+            nodes_stack.append(node)
+            words = []
+        elif kind == "}":
+            if not nodes_stack:
+                raise ValueError(f"{file}:{line}: unexpected '}}'")
+            node = nodes_stack.pop()
+            stack.pop()
+            node.close_pos = s
+            node.end = e
+    if nodes_stack:
+        raise ValueError(f"{file}: unclosed block '{nodes_stack[-1].name}' from line {nodes_stack[-1].line}")
+    return root
+
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="surrogateescape") as f:
+        return f.read()
+
+
+class NginxConfig:
+    def __init__(self, main, reader=read_text):
+        self.main = os.path.realpath(main)
+        self.prefix = os.path.dirname(self.main)
+        self.reader = reader
+        self.texts = {}
+        self.visited = {self.main}
+        self.root = self._load(self.main)
+
+    def _load(self, path):
+        text = self.reader(path)
+        self.texts[path] = text
+        nodes = ngx_parse(text, path)
+        self._resolve(nodes)
+        return nodes
+
+    def _resolve(self, nodes):
+        for node in nodes:
+            if node.name == "include" and node.args and node.children is None:
+                pat = node.args[0]
+                if not os.path.isabs(pat):
+                    pat = os.path.join(self.prefix, pat)
+                for p in sorted(glob.glob(pat)):
+                    rp = os.path.realpath(p)
+                    if os.path.isfile(rp) and rp not in self.visited:
+                        self.visited.add(rp)
+                        node.included.append((rp, self._load(rp)))
+            elif node.children is not None:
+                self._resolve(node.children)
+
+    @staticmethod
+    def effective(nodes):
+        for node in nodes:
+            if node.name == "include" and node.included:
+                for _, sub in node.included:
+                    yield from NginxConfig.effective(sub)
+            else:
+                yield node
+
+    def servers(self):
+        """Yield (server_node, context, http_level_directives)."""
+        for top in self.effective(self.root):
+            if top.name in ("http", "stream") and top.children is not None:
+                http_dirs = [d for d in self.effective(top.children) if d.children is None]
+                for s in self.effective(top.children):
+                    if s.name == "server" and s.children is not None:
+                        yield s, top.name, http_dirs
+
+
+def analyse_nginx_server(srv, context, http_dirs):
+    own = [d for d in NginxConfig.effective(srv.children) if d.children is None]
+    names = []
+    for d in own:
+        if d.name == "server_name":
+            names += d.args
+    listens = [d.args for d in own if d.name == "listen"]
+    ssl_listen = any(("ssl" in a or "quic" in a) for a in listens) or any(d.name == "ssl" and d.args[:1] == ["on"] for d in own)
+    port = "443"
+    for a in listens:
+        if a and ("ssl" in a or "quic" in a):
+            addr = a[0]
+            if addr.isdigit():
+                port = addr
+            elif re.search(r":(\d+)$", addr):
+                port = re.search(r":(\d+)$", addr).group(1)
+            break
+    own_certs = [d for d in own if d.name == "ssl_certificate"]
+    own_keys = [d for d in own if d.name == "ssl_certificate_key"]
+    inh_certs = [d for d in http_dirs if d.name == "ssl_certificate"]
+    inh_keys = [d for d in http_dirs if d.name == "ssl_certificate_key"]
+    inherited = not own_certs
+    certs = inh_certs if inherited else own_certs
+    keys = inh_keys if inherited else own_keys
+    conf_cmds = [d for d in own if d.name == "ssl_conf_command"]
+    inh_conf_cmds = [d for d in http_dirs if d.name == "ssl_conf_command"]
+    return {
+        "kind": f"nginx {context} server",
+        "file": srv.file, "line": srv.line, "node": srv,
+        "names": names, "port": port, "listens": [" ".join(a) for a in listens],
+        "tls": bool(ssl_listen and certs),
+        "certs": certs, "keys": keys, "certs_inherited": inherited and bool(certs),
+        "own_certs": own_certs, "own_keys": own_keys,
+        "conf_cmds": conf_cmds, "inh_conf_cmds": inh_conf_cmds if not conf_cmds else [],
+        "quic": any("quic" in a for a in listens),
+        "protocols": next((" ".join(d.args) for d in reversed(own) if d.name == "ssl_protocols"), None)
+        or next((" ".join(d.args) for d in reversed(http_dirs) if d.name == "ssl_protocols"), "default"),
+        "groups": next((" ".join(d.args) for d in reversed(own) if d.name == "ssl_ecdh_curve"), None)
+        or next((" ".join(d.args) for d in reversed(http_dirs) if d.name == "ssl_ecdh_curve"), "auto"),
+    }
+
+
+def ngx_directive_text(name, args):
+    def q(a):
+        return a if a and not re.search(r"[\s;{}'\"#]", a) else '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return " ".join([name] + [q(a) for a in args]) + ";"
+
+
+# --------------------------------------------------------------------------- apache parser
+
+class ApDirective:
+    __slots__ = ("name", "args", "file", "l0", "l1", "raw")
+
+    def __init__(self, name, args, file, l0, l1, raw):
+        self.name, self.args, self.file, self.l0, self.l1, self.raw = name, args, file, l0, l1, raw
+
+
+class ApVhost:
+    def __init__(self, addrs, file, l0):
+        self.addrs, self.file, self.l0, self.l1 = addrs, file, l0, None
+        self.dirs = []
+
+
+def ap_split(s):
+    try:
+        return shlex.split(s, posix=True)
+    except ValueError:
+        return s.split()
+
+
+class ApacheConfig:
+    def __init__(self, main, reader=read_text):
+        self.reader = reader
+        self.main = os.path.realpath(main)
+        self.lines = {}
+        self.server_root = os.path.dirname(self.main)
+        self.defines = dict(os.environ)
+        self.global_dirs = []
+        self.vhosts = []
+        self.visited = set()
+        self._envvars()
+        self._load(self.main, None)
+
+    def _envvars(self):
+        ev = os.path.join(os.path.dirname(self.main), "envvars")
+        if os.path.isfile(ev):
+            for line in open(ev, errors="replace"):
+                m = re.match(r"^\s*export\s+(\w+)=(.*)$", line)
+                if m:
+                    v = m.group(2).strip().strip("'\"")
+                    if "$" not in v:
+                        self.defines.setdefault(m.group(1), v)
+
+    def expand(self, s):
+        return re.sub(r"\$\{(\w+)\}", lambda m: self.defines.get(m.group(1), m.group(0)), s)
+
+    def _load(self, path, vhost):
+        path = os.path.realpath(path)
+        if path in self.visited:
+            return
+        self.visited.add(path)
+        lines = self.reader(path).splitlines(keepends=True)
+        self.lines[path] = lines
+        i = 0
+        while i < len(lines):
+            l0 = i
+            raw = lines[i].rstrip("\r\n")
+            while raw.endswith("\\") and i + 1 < len(lines):
+                i += 1
+                raw = raw[:-1] + " " + lines[i].strip()
+            l1 = i
+            i += 1
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("</"):
+                tag = s[2:].rstrip(">").strip().lower()
+                if tag == "virtualhost" and vhost is not None and vhost.file == path and vhost.l1 is None:
+                    vhost.l1 = l0
+                    self.vhosts.append(vhost)
+                    vhost = None
+                continue
+            if s.startswith("<"):
+                inner = s[1:].rstrip(">").strip()
+                parts = ap_split(inner)
+                if parts and parts[0].lower() == "virtualhost":
+                    vhost = ApVhost(parts[1:], path, l0)
+                continue
+            parts = ap_split(s)
+            if not parts:
+                continue
+            name, args = parts[0], [self.expand(a) for a in parts[1:]]
+            low = name.lower()
+            if low == "define" and len(args) >= 2:
+                self.defines[args[0]] = args[1]
+            if low == "serverroot" and args:
+                self.server_root = args[0]
+            d = ApDirective(name, args, path, l0, l1, raw)
+            if vhost is not None:
+                vhost.dirs.append(d)
+            else:
+                self.global_dirs.append(d)
+            if low in ("include", "includeoptional") and args:
+                pat = args[0]
+                if not os.path.isabs(pat):
+                    pat = os.path.join(self.server_root, pat)
+                matches = sorted(glob.glob(pat))
+                if not matches and low == "include" and not glob.has_magic(pat):
+                    warn(f"{path}:{l0 + 1}: Include {args[0]} not found")
+                for p in matches:
+                    if os.path.isdir(p):
+                        for root, _, files in sorted(os.walk(p)):
+                            for fn in sorted(files):
+                                self._load(os.path.join(root, fn), vhost)
+                    else:
+                        self._load(p, vhost)
+        if vhost is not None and vhost.file == path and vhost.l1 is None:
+            raise ValueError(f"{path}:{vhost.l0 + 1}: <VirtualHost> not closed in the same file")
+
+
+def analyse_apache_vhost(vh, cfg):
+    def named(n, dirs):
+        return [d for d in dirs if d.name.lower() == n]
+    names = []
+    for d in named("servername", vh.dirs):
+        names += [a.split("://")[-1].split(":")[0] for a in d.args[:1]]
+    for d in named("serveralias", vh.dirs):
+        names += d.args
+    port = "443"
+    for a in vh.addrs:
+        if ":" in a:
+            port = a.rsplit(":", 1)[1]
+    engine = any(d.args[:1] and d.args[0].lower() == "on" for d in named("sslengine", vh.dirs))
+    own_certs, own_keys = named("sslcertificatefile", vh.dirs), named("sslcertificatekeyfile", vh.dirs)
+    g_certs, g_keys = named("sslcertificatefile", cfg.global_dirs), named("sslcertificatekeyfile", cfg.global_dirs)
+    inherited = not own_certs
+    certs, keys = (g_certs, g_keys) if inherited else (own_certs, own_keys)
+    proto = next((" ".join(d.args) for d in reversed(named("sslprotocol", vh.dirs))), None) \
+        or next((" ".join(d.args) for d in reversed(named("sslprotocol", cfg.global_dirs))), "default")
+    groups = "default"
+    for d in named("sslopensslconfcmd", cfg.global_dirs) + named("sslopensslconfcmd", vh.dirs):
+        if d.args and d.args[0].lower() in ("groups", "curves"):
+            groups = " ".join(d.args[1:])
+    return {
+        "kind": "apache VirtualHost",
+        "file": vh.file, "line": vh.l0 + 1, "node": vh,
+        "names": names, "port": port, "listens": vh.addrs,
+        "tls": bool(engine and certs),
+        "certs": certs, "keys": keys, "certs_inherited": inherited and bool(certs),
+        "own_certs": own_certs, "own_keys": own_keys,
+        "quic": False, "protocols": proto, "groups": groups,
+    }
+
+
+# --------------------------------------------------------------------------- shared
+
+def strip_managed(text):
+    out, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        s = line.lstrip()
+        if s.startswith(BEGIN):
+            skipping = True
+            continue
+        if skipping:
+            if s.startswith(END):
+                skipping = False
+            continue
+        if DISABLED in line:
+            i = line.index(DISABLED)
+            line = line[:i] + line[i + len(DISABLED):]
+        out.append(line)
+    return "".join(out)
+
+
+def detect_conf(server, conf):
+    if conf:
+        return conf
+    cands = {
+        "nginx": ["/etc/nginx/nginx.conf", "/usr/local/nginx/conf/nginx.conf", "/usr/local/etc/nginx/nginx.conf"],
+        "apache": ["/etc/apache2/apache2.conf", "/etc/httpd/conf/httpd.conf", "/usr/local/apache2/conf/httpd.conf"],
+    }[server]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    die(f"no {server} configuration found; pass --conf")
+
+
+def server_runtime(server):
+    """(binary version, linked OpenSSL version) as far as they can be found."""
+    if server == "nginx":
+        exe = shutil.which("nginx")
+        if not exe:
+            return None, None
+        out = run([exe, "-V"]).stderr
+        v = re.search(r"nginx/(\S+)", out)
+        o = re.search(r"running with OpenSSL (\S+)", out) or re.search(r"built with OpenSSL (\S+)", out)
+        return (v.group(1) if v else "?"), (o.group(1) if o else None)
+    exe = shutil.which("apache2") or shutil.which("httpd")
+    ver = None
+    if exe:
+        v = re.search(r"Apache/(\S+)", run([exe, "-v"]).stdout)
+        ver = v.group(1) if v else "?"
+    for mod in ("/usr/lib/apache2/modules/mod_ssl.so", "/usr/lib64/httpd/modules/mod_ssl.so",
+                "/usr/lib/httpd/modules/mod_ssl.so", "/usr/local/apache2/modules/mod_ssl.so"):
+        if os.path.isfile(mod):
+            return ver, linked_libssl_version(mod)
+    return ver, None
+
+
+def default_test_cmd(server, conf):
+    if server == "nginx":
+        return f"nginx -t -q -c {shlex.quote(conf)}"
+    for c in ("apache2ctl", "apachectl"):
+        if shutil.which(c):
+            return f"{c} -t"
+    return "httpd -t"
+
+
+def default_reload_cmd(server):
+    if server == "nginx":
+        return "nginx -s reload"
+    for c in ("apache2ctl", "apachectl"):
+        if shutil.which(c):
+            return f"{c} graceful"
+    return "httpd -k graceful"
+
+
+def load(server, conf, strip=False):
+    """Parse the configuration. With strip=True every file is read as it would look without
+    pqc-webconf changes, which makes migrate idempotent. Returns (cfg, raw_texts, parsed_texts, sites)."""
+    reader = (lambda p: strip_managed(read_text(p))) if strip else read_text
+    if server == "nginx":
+        cfg = NginxConfig(conf, reader)
+        parsed = dict(cfg.texts)
+        sites = [analyse_nginx_server(sv, ctx, h) for sv, ctx, h in cfg.servers()]
+    else:
+        cfg = ApacheConfig(conf, reader)
+        parsed = {p: "".join(ls) for p, ls in cfg.lines.items()}
+        sites = [analyse_apache_vhost(v, cfg) for v in cfg.vhosts]
+    raw = {p: read_text(p) for p in parsed}
+    return cfg, raw, parsed, sites
+
+
+# --------------------------------------------------------------------------- inventory
+
+def cmd_inventory(a):
+    conf = detect_conf(a.server, a.conf)
+    _, raw, _, sites = load(a.server, conf, strip=True)
+    ver, ossl = server_runtime(a.server)
+    cli = openssl_version()
+    if not version_ge(cli):
+        warn(f"openssl in PATH is {cli}; ML-DSA certificates are reported by OID only")
+    rows = []
+    for s in sites:
+        pairs = []
+        for i, c in enumerate(s["certs"]):
+            path = c.args[0] if c.args else "?"
+            info = cert_info(path)
+            pairs.append({"cert": path, "key": s["keys"][i].args[0] if i < len(s["keys"]) and s["keys"][i].args else None,
+                          "alg": info["alg"], "days": info["days"], "san": info["san"], "exists": info["exists"]})
+        notes = []
+        if not s["tls"]:
+            pairs = []
+        if s["tls"] and len(s["certs"]) != len(s["keys"]):
+            notes.append("certificate/key count mismatch (key inside cert file?)")
+        if s["tls"] and s["certs_inherited"]:
+            notes.append("certificates inherited from the enclosing level")
+        if s.get("quic"):
+            notes.append("QUIC/HTTP3 listener: verify separately")
+        if s["tls"] and not any(is_pqc_alg(p["alg"]) for p in pairs):
+            notes.append("no ML-DSA certificate")
+        g = s["groups"] or ""
+        if s["tls"] and g not in ("auto", "default") and "MLKEM" not in g.upper():
+            notes.append("groups pinned without hybrid ML-KEM")
+        m = re.search(re.escape(BEGIN) + r" profile=(\S+) site=" + re.escape(site_name(s["names"], s["port"])) + " ", raw.get(s["file"], ""))
+        managed = m.group(1) if m else None
+        if managed:
+            notes.insert(0, f"managed by pqc-webconf, profile {managed}")
+        rows.append({
+            "kind": s["kind"], "file": s["file"], "line": s["line"], "site": site_name(s["names"], s["port"]),
+            "names": cert_names(s["names"]), "listen": s["listens"], "tls": s["tls"], "protocols": s["protocols"],
+            "groups": s["groups"], "certs": pairs, "managed": managed, "notes": notes,
+        })
+    ready = version_ge(ossl)
+    report = {
+        "server": a.server, "conf": conf, "version": ver, "linked_openssl": ossl,
+        "pqc_capable": ready, "openssl_cli": cli, "sites": rows,
+    }
+    if a.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"| {a.server} | conf | version | linked OpenSSL | PQC capable (>= 3.5) |")
+        print("| --- | --- | --- | --- | --- |")
+        print(f"| runtime | {conf} | {ver or 'not installed'} | {ossl or 'unknown'} | {'yes' if ready else 'NO: use the container images'} |")
+        print()
+        print("| Site | Kind | File:line | TLS | Names | Certificates | Protocols | Groups | Notes |")
+        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        for r in rows:
+            certs = ", ".join(f"{c['alg']}{'' if c['exists'] else ' (missing)'}" + (f" {c['days']}d" if c['days'] is not None else "") for c in r["certs"]) or "-"
+            print(f"| {r['site']} | {r['kind']} | {r['file']}:{r['line']} | {'yes' if r['tls'] else 'no'} | "
+                  f"{' '.join(r['names']) or '-'} | {certs} | {r['protocols']} | {r['groups']} | {'; '.join(r['notes']) or '-'} |")
+    if a.emit_csr:
+        seen = set()
+        print()
+        print("# CSR commands (run on this host, sign on the CA host with: pqc-ca sign <csr> <dir>)")
+        for r in rows:
+            if r["tls"] and r["site"] not in seen and r["names"]:
+                seen.add(r["site"])
+                print(f"pqc-ca key-csr {shlex.quote(r['site'])} {' '.join(shlex.quote(n) for n in r['names'])} --out {shlex.quote(a.emit_csr)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- migrate
+
+def load_site_map(path):
+    m = {}
+    if path:
+        for line in open(path):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                k, v = line.split(None, 1)
+                m[k] = v.strip()
+    return m
+
+
+def check_pqc_cert(site, names, cdir):
+    cert, key = os.path.join(cdir, "fullchain.pem"), os.path.join(cdir, "privkey.pem")
+    errs = []
+    if not os.path.isfile(cert) or not os.path.isfile(key):
+        return cert, key, [f"missing {cert} / {key} (issue with: pqc-ca key-csr {site} {' '.join(names)})"]
+    info = cert_info(cert)
+    if not is_pqc_alg(info["alg"]):
+        errs.append(f"{cert} is {info['alg']}, not ML-DSA")
+    if info["days"] is not None and info["days"] < 1:
+        errs.append(f"{cert} expired")
+    miss = [n for n in names if not name_covered(n, info["san"])]
+    if miss:
+        errs.append(f"{cert} does not cover: {' '.join(miss)}")
+    if not key_matches(cert, key):
+        errs.append(f"{key} does not match {cert}")
+    return cert, key, errs
+
+
+def plan(a, profiles):
+    conf = detect_conf(a.server, a.conf)
+    cli = openssl_version()
+    if not version_ge(cli):
+        die(f"openssl in PATH is {cli}; 3.5+ is needed to validate ML-DSA certificates (use the pqc-web-tools image)")
+    prof = profiles[a.profile]
+    cfg, orig_texts, stexts, sites = load(a.server, conf, strip=True)
+    smap = load_site_map(a.site_map)
+    only = set(filter(None, (a.only or "").split(",")))
+    excl = set(filter(None, (a.exclude or "").split(",")))
+    edits = {}      # file -> list of (start, end, replacement)  (nginx: char offsets, apache: line indices)
+    report = []
+    by_listen = {}
+    for s in sites:
+        name = site_name(s["names"], s["port"])
+        row = {"site": name, "file": s["file"], "line": s["line"], "action": "", "reason": ""}
+        report.append(row)
+        if not s["tls"]:
+            row["action"], row["reason"] = "skip", "not a TLS server"
+            continue
+        for l in s["listens"]:
+            by_listen.setdefault(l if a.server == "apache" else l.split()[0], []).append(name)
+        if (only and name not in only) or name in excl:
+            row["action"], row["reason"] = "skip", "filtered"
+            continue
+        if len(s["certs"]) != len(s["keys"]):
+            row["action"], row["reason"] = "skip", "certificate/key directive count differs; pair every certificate with its key first"
+            continue
+        existing = [cert_info(c.args[0])["alg"] for c in s["certs"] if c.args]
+        if any(is_pqc_alg(x) for x in existing):
+            row["action"], row["reason"] = "skip", "already has an ML-DSA certificate outside pqc-webconf"
+            continue
+        names = cert_names(s["names"])
+        if not names:
+            row["action"], row["reason"] = "skip", "no usable server names"
+            continue
+        cdir = smap.get(name, os.path.join(a.cert_root, name))
+        cert, key, errs = check_pqc_cert(name, names, cdir)
+        if errs and not a.allow_missing_certs:
+            row["action"], row["reason"] = "skip", "; ".join(errs)
+            continue
+        disable = []
+        if not prof["classic_cert"]:
+            for d in s["own_certs"] + s["own_keys"]:
+                if d.file != s["file"]:
+                    disable = None
+                    break
+                disable.append(d)
+            if disable is None:
+                row["action"], row["reason"] = "skip", "pqc-only: classical certificate comes from an included file"
+                continue
+        if a.server == "nginx":
+            ok = plan_nginx(s, prof, name, cert, key, disable, edits)
+        else:
+            ok = plan_apache(s, prof, name, cert, key, disable, edits)
+        row["action"] = "migrate" if ok else "skip"
+        row["reason"] = ("; ".join(errs) + " (allowed by --allow-missing-certs)") if errs else ""
+        if s["certs_inherited"] and prof["classic_cert"]:
+            row["reason"] = (row["reason"] + "; " if row["reason"] else "") + "inherited certificates copied into the server"
+    return conf, cfg, orig_texts, stexts, edits, report, by_listen
+
+
+def indent_of(text, pos):
+    ls = text.rfind("\n", 0, pos) + 1
+    m = re.match(r"[ \t]*", text[ls:pos])
+    return m.group(0) if m else ""
+
+
+def plan_nginx(s, prof, name, cert, key, disable, edits):
+    srv = s["node"]
+    from_file = srv.file
+    lines = []
+    if s["certs_inherited"] and prof["classic_cert"]:
+        lines.append("# inherited from http{}: nginx does not merge server and http certificate lists")
+        for c, k in zip(s["certs"], s["keys"]):
+            lines.append(ngx_directive_text("ssl_certificate", c.args))
+            lines.append(ngx_directive_text("ssl_certificate_key", k.args))
+    lines.append(ngx_directive_text("ssl_certificate", [cert]))
+    lines.append(ngx_directive_text("ssl_certificate_key", [key]))
+    if s["inh_conf_cmds"]:
+        kept = [d for d in s["inh_conf_cmds"] if d.args and d.args[0].lower() not in CONF_CMDS_OWNED]
+        if kept:
+            lines.append("# inherited from http{}: a server-level ssl_conf_command replaces the http-level list")
+            lines += [ngx_directive_text("ssl_conf_command", d.args) for d in kept]
+    lines += [
+        f"ssl_conf_command MinProtocol {prof['min_protocol']};",
+        "ssl_conf_command Options ServerPreference;",
+        f"ssl_conf_command Groups {prof['groups']};",
+        f"ssl_conf_command SignatureAlgorithms {prof['sigalgs']};",
+    ]
+    fe = edits.setdefault(from_file, [])
+    fe.append(("nginx-block", srv, name, prof["name"], lines))
+    for d in disable:
+        fe.append(("nginx-disable", d))
+    return True
+
+
+def plan_apache(s, prof, name, cert, key, disable, edits):
+    vh = s["node"]
+    lines = []
+    if s["certs_inherited"] and prof["classic_cert"]:
+        lines.append("# inherited from the main server config: vhost certificates replace, not extend, that list")
+        for c, k in zip(s["certs"], s["keys"]):
+            lines.append(f"SSLCertificateFile {c.args[0]}")
+            lines.append(f"SSLCertificateKeyFile {k.args[0]}")
+    lines += [
+        f"SSLCertificateFile {cert}",
+        f"SSLCertificateKeyFile {key}",
+        f"SSLOpenSSLConfCmd MinProtocol {prof['min_protocol']}",
+        "SSLOpenSSLConfCmd Options ServerPreference",
+        f"SSLOpenSSLConfCmd Groups {prof['groups']}",
+        f"SSLOpenSSLConfCmd SignatureAlgorithms {prof['sigalgs']}",
+    ]
+    fe = edits.setdefault(vh.file, [])
+    fe.append(("apache-block", vh, name, prof["name"], lines))
+    for d in disable:
+        fe.append(("apache-disable", d))
+    return True
+
+
+def render(server, stexts, edits):
+    """Apply planned edits to the stripped texts. Returns {file: new_text}."""
+    out = {}
+    for f, es in edits.items():
+        text = stexts[f]
+        if server == "nginx":
+            spans = []
+            for e in es:
+                if e[0] == "nginx-block":
+                    _, srv, name, pname, lines = e
+                    ind = indent_of(text, srv.start)
+                    inner = ind + "    "
+                    block = f"{inner}{BEGIN} profile={pname} site={name} >>>\n" + "".join(f"{inner}{l}\n" for l in lines) + f"{inner}{END}\n"
+                    close = srv.close_pos
+                    ls = text.rfind("\n", 0, close) + 1
+                    if text[ls:close].strip() == "":
+                        spans.append((ls, ls, block))
+                    else:
+                        spans.append((close, close, "\n" + block + ind))
+                else:
+                    d = e[1]
+                    seg = text[d.start:d.end]
+                    ind = indent_of(text, d.start)
+                    ls = text.rfind("\n", 0, d.start) + 1
+                    le = text.find("\n", d.end)
+                    le = len(text) if le < 0 else le
+                    alone = text[ls:d.start].strip() == "" and text[d.end:le].strip() == ""
+                    body = "\n".join(f"{ind if i else ''}{DISABLED}{x.lstrip() if i else x}" for i, x in enumerate(seg.split("\n")))
+                    if alone:
+                        spans.append((d.start, d.end, body))
+                    else:
+                        spans.append((d.start, d.end, f"\n{ind}{body}\n{ind}"))
+            for st, en, rep in sorted(spans, key=lambda x: (x[0], x[1]), reverse=True):
+                text = text[:st] + rep + text[en:]
+        else:
+            lines = text.splitlines(keepends=True)
+            inserts, disables = [], set()
+            for e in es:
+                if e[0] == "apache-block":
+                    _, vh, name, pname, blines = e
+                    ind = re.match(r"[ \t]*", lines[vh.l0]).group(0) + "    "
+                    block = [f"{ind}{BEGIN} profile={pname} site={name} >>>\n"] + [f"{ind}{l}\n" for l in blines] + [f"{ind}{END}\n"]
+                    inserts.append((vh.l1, block))
+                else:
+                    d = e[1]
+                    disables.update(range(d.l0, d.l1 + 1))
+            for i in sorted(disables):
+                m = re.match(r"([ \t]*)(.*)", lines[i], re.S)
+                lines[i] = m.group(1) + DISABLED + m.group(2)
+            for idx, block in sorted(inserts, key=lambda x: x[0], reverse=True):
+                if idx > 0 and not lines[idx - 1].endswith("\n"):
+                    lines[idx - 1] += "\n"
+                lines[idx:idx] = block
+            text = "".join(lines)
+        out[f] = text
+    return out
+
+
+def sha256(s):
+    return hashlib.sha256(s.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def atomic_write(path, text):
+    st = os.stat(path)
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".pqc-webconf.", dir=d)
+    with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(text)
+    os.chmod(tmp, st.st_mode & 0o7777)
+    try:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except PermissionError:
+        pass
+    os.replace(tmp, path)
+
+
+def write_with_backup(server, conf, orig_texts, new_texts, a, action, profile=None):
+    changed = {f: t for f, t in new_texts.items() if t != orig_texts.get(f)}
+    if not changed:
+        print("pqc-webconf: nothing to change")
+        return 0
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bdir = os.path.join(a.backup_root, f"{server}-{ts}")
+    n = 1
+    while os.path.exists(bdir):
+        n += 1
+        bdir = os.path.join(a.backup_root, f"{server}-{ts}-{n:02d}")
+    os.makedirs(os.path.join(bdir, "files"), mode=0o700)
+    manifest = {"created": ts, "server": server, "conf": conf, "action": action, "profile": profile,
+                "test_cmd": a.test_cmd or default_test_cmd(server, conf), "files": []}
+    for f in changed:
+        dst = os.path.join(bdir, "files", f.lstrip("/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(f, dst)
+        manifest["files"].append({"path": f, "sha256_before": sha256(orig_texts[f]), "sha256_after": sha256(changed[f])})
+    with open(os.path.join(bdir, "MANIFEST.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    for f, t in changed.items():
+        atomic_write(f, t)
+    print(f"pqc-webconf: wrote {len(changed)} file(s), backup in {bdir}")
+    test = manifest["test_cmd"]
+    r = subprocess.run(test, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        print(r.stdout, file=sys.stderr)
+        warn(f"config test failed ({test}); restoring backup")
+        restore(bdir, manifest, force=True)
+        return 1
+    print(f"pqc-webconf: config test passed ({test})")
+    if a.reload:
+        rc = a.reload_cmd or default_reload_cmd(server)
+        r = subprocess.run(rc, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(f"pqc-webconf: reload ({rc}) exit {r.returncode}")
+        if r.returncode != 0:
+            print(r.stdout, file=sys.stderr)
+            return 1
+    else:
+        print(f"pqc-webconf: not reloaded; run: {a.reload_cmd or default_reload_cmd(server)}")
+    print(f"pqc-webconf: rollback with: pqc-webconf rollback {bdir}")
+    return 0
+
+
+def restore(bdir, manifest, force=False):
+    for e in manifest["files"]:
+        src = os.path.join(bdir, "files", e["path"].lstrip("/"))
+        cur = open(e["path"], encoding="utf-8", errors="surrogateescape").read() if os.path.exists(e["path"]) else ""
+        if not force and sha256(cur) != e["sha256_after"]:
+            die(f"{e['path']} changed since migration; use --force to restore anyway")
+        atomic_write(e["path"], open(src, encoding="utf-8", errors="surrogateescape").read())
+        print(f"pqc-webconf: restored {e['path']}")
+
+
+def show_diff(orig_texts, new_texts):
+    for f in sorted(new_texts):
+        if new_texts[f] != orig_texts[f]:
+            sys.stdout.writelines(difflib.unified_diff(
+                orig_texts[f].splitlines(keepends=True), new_texts[f].splitlines(keepends=True),
+                fromfile=f"a{f}", tofile=f"b{f}"))
+
+
+def cmd_migrate(a):
+    profiles = load_profiles()
+    conf, cfg, orig_texts, stexts, edits, report, by_listen = plan(a, profiles)
+    new = dict(stexts)
+    new.update(render(a.server, stexts, edits))
+    print(f"| Site | File:line | Action | Detail |")
+    print("| --- | --- | --- | --- |")
+    for r in report:
+        print(f"| {r['site']} | {r['file']}:{r['line']} | {r['action']} | {r['reason'] or '-'} |")
+    migrated = {r["site"] for r in report if r["action"] == "migrate"}
+    for addr, sites in by_listen.items():
+        if len(set(sites)) > 1 and migrated & set(sites) and not set(sites) <= migrated:
+            print(f"\nnote: {addr} is shared by {', '.join(sorted(set(sites)))}; key exchange groups and minimum protocol "
+                  f"follow the default server of that address, so migrate it too")
+    print()
+    if not a.apply:
+        show_diff(orig_texts, new)
+        print("\npqc-webconf: dry run; add --apply to write")
+        return 0
+    return write_with_backup(a.server, conf, orig_texts, new, a, "migrate", a.profile)
+
+
+def cmd_remove(a):
+    conf = detect_conf(a.server, a.conf)
+    _, texts, _, _ = load(a.server, conf)
+    new = {f: strip_managed(t) for f, t in texts.items()}
+    if not a.apply:
+        show_diff(texts, new)
+        print("\npqc-webconf: dry run; add --apply to write")
+        return 0
+    return write_with_backup(a.server, conf, texts, new, a, "remove")
+
+
+def cmd_rollback(a):
+    mf = os.path.join(a.backup_dir, "MANIFEST.json")
+    if not os.path.isfile(mf):
+        die(f"{mf} not found")
+    manifest = json.load(open(mf))
+    restore(a.backup_dir, manifest, force=a.force)
+    test = a.test_cmd or manifest.get("test_cmd")
+    r = subprocess.run(test, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(f"pqc-webconf: config test ({test}) exit {r.returncode}")
+    if r.returncode != 0:
+        print(r.stdout, file=sys.stderr)
+        return 1
+    if a.reload:
+        rc = a.reload_cmd or default_reload_cmd(manifest["server"])
+        r = subprocess.run(rc, shell=True)
+        return r.returncode
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="pqc-webconf", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--server", choices=["nginx", "apache"], required=True)
+        sp.add_argument("--conf", help="main configuration file (auto-detected)")
+
+    def writer(sp):
+        sp.add_argument("--apply", action="store_true", help="write changes (default: dry run with diff)")
+        sp.add_argument("--reload", action="store_true", help="reload the server after a passing config test")
+        sp.add_argument("--test-cmd")
+        sp.add_argument("--reload-cmd")
+        sp.add_argument("--backup-root", default=os.environ.get("PQC_BACKUP_ROOT", "/var/backups/pqc-webconf"))
+
+    sp = sub.add_parser("inventory", help="list TLS sites, certificates and PQC readiness")
+    common(sp)
+    sp.add_argument("--format", choices=["table", "json"], default="table")
+    sp.add_argument("--emit-csr", metavar="DIR", help="print pqc-ca key-csr commands writing to DIR")
+    sp.set_defaults(func=cmd_inventory)
+
+    sp = sub.add_parser("migrate", help="add the ML-DSA certificate and profile to TLS sites")
+    common(sp)
+    writer(sp)
+    sp.add_argument("--profile", choices=["compat", "pqc-first", "pqc-only"], required=True)
+    sp.add_argument("--cert-root", default=os.environ.get("PQC_CERT_ROOT", "/etc/pqc/certs"),
+                    help="directory with <site>/fullchain.pem and <site>/privkey.pem")
+    sp.add_argument("--site-map", help="file with '<site> <cert-dir>' lines overriding --cert-root")
+    sp.add_argument("--only", help="comma separated site names")
+    sp.add_argument("--exclude", help="comma separated site names")
+    sp.add_argument("--allow-missing-certs", action="store_true", help="plan even when the ML-DSA files fail validation")
+    sp.set_defaults(func=cmd_migrate)
+
+    sp = sub.add_parser("remove", help="strip every pqc-webconf block and re-enable disabled lines")
+    common(sp)
+    writer(sp)
+    sp.set_defaults(func=cmd_remove)
+
+    sp = sub.add_parser("rollback", help="restore the files of one backup")
+    sp.add_argument("backup_dir")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--test-cmd")
+    sp.add_argument("--reload", action="store_true")
+    sp.add_argument("--reload-cmd")
+    sp.set_defaults(func=cmd_rollback)
+
+    a = p.parse_args()
+    try:
+        sys.exit(a.func(a))
+    except (ValueError, OSError) as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()

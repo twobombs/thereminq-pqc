@@ -1,0 +1,154 @@
+#!/bin/sh
+# pqc-edge-nginx: render and run a dual-stack (classical + ML-DSA) TLS edge in front of an existing
+# ingress controller or web backend. Configuration through environment, see lib/edge-common.sh.
+set -eu
+
+PQC_SHARE=${PQC_SHARE:-/usr/local/share/pqc-web}
+# shellcheck source=../../lib/edge-common.sh
+. "$PQC_SHARE/edge-common.sh"
+
+PQC_CLIENT_MAX_BODY=${PQC_CLIENT_MAX_BODY:-0}
+PQC_PROXY_TIMEOUT=${PQC_PROXY_TIMEOUT:-300s}
+PQC_WORKERS=${PQC_WORKERS:-auto}
+
+listen_tls() {   # extra args
+    pp=""; [ "$PQC_PROXY_PROTOCOL" = yes ] && pp=" proxy_protocol"
+    echo "    listen $PQC_LISTEN_TLS ssl$pp$*;"
+    [ "$PQC_IPV6" = yes ] && echo "    listen [::]:$PQC_LISTEN_TLS ssl$pp$*;"
+    echo "    http2 on;"
+}
+
+tls_common() {
+    cat <<EOF
+    ssl_session_cache shared:pqc_edge:20m;
+    ssl_session_timeout 1h;
+    ssl_session_tickets off;
+    ssl_conf_command MinProtocol $(echo "$PROFILE_PROTOCOLS" | tr ' ' '\n' | sort | head -n 1);
+    ssl_conf_command Options ServerPreference;
+    ssl_conf_command Groups $PROFILE_GROUPS;
+    ssl_conf_command SignatureAlgorithms $PROFILE_SIGALGS;
+EOF
+}
+
+proxy_block() {   # upstream
+    up=$1
+    cat <<EOF
+        proxy_pass $up;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port $PQC_FORWARDED_PORT;
+        proxy_set_header X-PQC-TLS-Protocol \$ssl_protocol;
+        proxy_set_header X-PQC-TLS-Group \$ssl_curve;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_read_timeout $PQC_PROXY_TIMEOUT;
+        proxy_send_timeout $PQC_PROXY_TIMEOUT;
+EOF
+    case "$up" in
+        https://*)
+            echo "        proxy_ssl_server_name on;"
+            echo "        proxy_ssl_name \$host;"
+            echo "        proxy_ssl_protocols TLSv1.2 TLSv1.3;"
+            echo "        proxy_ssl_conf_command Groups $(_pqc_get PQC_GROUPS_HYBRID):$(_pqc_get PQC_GROUPS_CLASSIC);"
+            if [ -n "$PQC_UPSTREAM_CA" ]; then
+                echo "        proxy_ssl_verify on;"
+                echo "        proxy_ssl_verify_depth 3;"
+                echo "        proxy_ssl_trusted_certificate $PQC_UPSTREAM_CA;"
+            else
+                echo "        proxy_ssl_verify off;"
+            fi ;;
+    esac
+}
+
+render() {   # outdir
+    out=$1; rm -rf "$out"; mkdir -p "$out"
+    edge_sites > "$out/sites.list"
+    [ -s "$out/sites.list" ] || { log "no valid sites in $PQC_SITES_DIR"; return 1; }
+    first=$(head -n 1 "$out/sites.list")
+    f_pc=$(echo "$first" | cut -d'|' -f3); f_pk=$(echo "$first" | cut -d'|' -f4)
+    f_cc=$(echo "$first" | cut -d'|' -f5); f_ck=$(echo "$first" | cut -d'|' -f6)
+    {
+        cat <<EOF
+# rendered by pqc-edge-nginx, profile=$PROFILE_NAME
+worker_processes $PQC_WORKERS;
+pid $PQC_RUN/nginx.pid;
+error_log stderr notice;
+events { worker_connections 4096; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server_tokens off;
+    client_body_temp_path $PQC_RUN/tmp/body;
+    proxy_temp_path $PQC_RUN/tmp/proxy;
+    fastcgi_temp_path $PQC_RUN/tmp/fastcgi;
+    uwsgi_temp_path $PQC_RUN/tmp/uwsgi;
+    scgi_temp_path $PQC_RUN/tmp/scgi;
+    client_max_body_size $PQC_CLIENT_MAX_BODY;
+    server_names_hash_bucket_size 128;
+    map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+    log_format pqc '\$remote_addr "\$host" "\$request" \$status \$ssl_protocol \$ssl_curve "\$http_user_agent"';
+    access_log /dev/stdout pqc;
+
+    # plain HTTP: health and redirect
+    server {
+        listen $PQC_LISTEN_HTTP default_server;
+EOF
+        [ "$PQC_IPV6" = yes ] && echo "        listen [::]:$PQC_LISTEN_HTTP default_server;"
+        cat <<EOF
+        location = /healthz { access_log off; return 200 "ok\n"; }
+EOF
+        if [ "$PQC_HTTP_REDIRECT" = yes ]; then
+            echo "        location / { return 301 https://\$host\$request_uri; }"
+        else
+            echo "        location / {"; proxy_block "$PQC_UPSTREAM" | sed 's/X-Forwarded-Proto https/X-Forwarded-Proto http/'; echo "        }"
+        fi
+        echo "    }"
+        echo
+        echo "    # default TLS server: decides key exchange groups and protocol floor for every SNI name"
+        echo "    server {"
+        listen_tls " default_server"
+        echo "    server_name _;"
+        [ -n "$f_cc" ] && echo "    ssl_certificate $f_cc;" && echo "    ssl_certificate_key $f_ck;"
+        echo "    ssl_certificate $f_pc;"; echo "    ssl_certificate_key $f_pk;"
+        tls_common
+        echo "    location / { return 421; }"
+        echo "    }"
+        while IFS='|' read -r site names pc pk cc ck up; do
+            echo
+            echo "    # site $site"
+            echo "    server {"
+            listen_tls ""
+            echo "    server_name $names;"
+            [ -n "$cc" ] && echo "    ssl_certificate $cc;" && echo "    ssl_certificate_key $ck;"
+            echo "    ssl_certificate $pc;"; echo "    ssl_certificate_key $pk;"
+            tls_common
+            [ -n "$PQC_HSTS" ] && echo "    add_header Strict-Transport-Security \"$PQC_HSTS\" always;"
+            echo "    location / {"; proxy_block "$up"; echo "    }"
+            echo "    }"
+        done < "$out/sites.list"
+        echo "}"
+    } > "$out/nginx.conf"
+    log "rendered $(wc -l < "$out/sites.list") site(s), profile $PROFILE_NAME"
+}
+
+test_conf() { nginx -t -q -c "$1/nginx.conf"; }
+reload() { nginx -c "$PQC_RUN/live/nginx.conf" -s reload; }
+
+case "${1:-run}" in
+    run)
+        edge_preflight
+        mkdir -p "$PQC_RUN/tmp"
+        render "$PQC_RUN/live" || fail "nothing to serve"
+        test_conf "$PQC_RUN/live" || fail "rendered configuration does not pass nginx -t"
+        if [ "$PQC_RELOAD_INTERVAL" -gt 0 ]; then
+            watch_loop render test_conf reload &
+        fi
+        exec nginx -c "$PQC_RUN/live/nginx.conf" -g "daemon off;"
+        ;;
+    render)   # print the configuration that would be served
+        edge_preflight; mkdir -p "$PQC_RUN/tmp"; render "$PQC_RUN/dry" && cat "$PQC_RUN/dry/nginx.conf" ;;
+    *) exec "$@" ;;
+esac

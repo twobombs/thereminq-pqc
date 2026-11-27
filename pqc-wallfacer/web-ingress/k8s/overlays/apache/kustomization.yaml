@@ -1,0 +1,8 @@
+# Same edge on Apache httpd 2.4 instead of nginx.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: pqc-web/edge-nginx
+    newName: pqc-web/edge-apache

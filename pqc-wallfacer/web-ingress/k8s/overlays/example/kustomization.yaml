@@ -1,0 +1,21 @@
+# Per-cluster overlay. Generate the two inputs with:
+#   pqc-k8s plan -o plan.tsv
+#   pqc-k8s secrets plan.tsv ./pqc-certs > secrets.yaml      (holds private keys: never commit it)
+#   pqc-k8s sites-patch plan.tsv > sites-patch.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - secrets.yaml
+images:
+  - name: pqc-web/edge-nginx
+    newName: registry.example.internal/pqc-web/edge-nginx
+    newTag: "1"
+patches:
+  - path: sites-patch.yaml
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata: {name: pqc-edge, namespace: pqc-edge}
+      data:
+        PQC_PROFILE: compat

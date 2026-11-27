@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pqc-edge
+  namespace: pqc-edge
+  labels: {app.kubernetes.io/name: pqc-edge}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+  selector:
+    matchLabels: {app.kubernetes.io/name: pqc-edge}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: pqc-edge}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 33
+        runAsGroup: 33
+        fsGroup: 33
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app.kubernetes.io/name: pqc-edge}
+      containers:
+        - name: edge
+          image: pqc-web/edge-nginx:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: {name: pqc-edge}
+          ports:
+            - {name: https, containerPort: 8443}
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: https}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec: {command: ["sleep", "5"]}
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: sites, mountPath: /etc/pqc/sites, readOnly: true}
+      volumes:
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+        # replaced by the output of: pqc-k8s sites-patch plan.tsv
+        - name: sites
+          projected:
+            defaultMode: 0440
+            sources: []

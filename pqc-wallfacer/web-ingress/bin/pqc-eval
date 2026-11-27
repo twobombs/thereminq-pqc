@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# pqc-eval: probe live TLS endpoints for post-quantum readiness (OpenSSL 3.5+ client side).
+#
+#   pqc-eval [options] <host[:port]> [...]
+#   pqc-eval [options] -f targets.txt          one target per line, '#' comments allowed
+#
+# Each target gets six handshakes:
+#   default    OpenSSL 3.5 client defaults (what curl / Python / Go-less tooling on current distros sends)
+#   hybrid     one handshake per hybrid group (X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024)
+#   classic    TLS 1.3 offering classical groups only (is harvest-now key exchange still accepted?)
+#   tls12      TLS 1.2 (no hybrid groups exist there)
+#   legacy     classical signature algorithms only (browser-like authentication)
+#   pqc        ML-DSA signature algorithms + hybrid groups only (PQC client)
+#
+# Readiness levels
+#   L0 NO-PQC     no hybrid key exchange
+#   L1 PQC-KEX    hybrid key exchange, no ML-DSA chain
+#   L2 DUAL       hybrid key exchange, ML-DSA chain for PQC clients, classical chain for legacy clients
+#   L3 PQC-ONLY   ML-DSA chain only, legacy authentication and classical-only key exchange refused
+
+set -uo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+export PQC_PROFILES_FILE=${PQC_PROFILES_FILE:-$HERE/../profiles/profiles.env}
+# shellcheck source=../lib/profile.sh
+. "$HERE/../lib/profile.sh"
+
+FORMAT=table
+PQC_CA=""
+CLASSIC_CA=""
+SNI=""
+TIMEOUT=8
+REQUIRE=""
+TARGETS=()
+
+usage() {
+    cat <<'EOF'
+usage: pqc-eval [options] <host[:port]>... | -f targets.txt
+
+  --ca FILE           PQC root (pqc-ca trust/pqc-web-root.pem) to verify the ML-DSA chain
+  --classic-ca FILE   CA bundle for the classical chain (default: system store)
+  --sni NAME          SNI / hostname to verify (default: the target host)
+  --format F          table (markdown) | tsv | json        default: table
+  --timeout S         per handshake, seconds                default: 8
+  --require LEVEL     exit 1 when any target is below L0|L1|L2|L3
+  -f FILE             read targets from FILE
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ca) PQC_CA=$2; shift 2 ;;
+        --classic-ca) CLASSIC_CA=$2; shift 2 ;;
+        --sni) SNI=$2; shift 2 ;;
+        --format) FORMAT=$2; shift 2 ;;
+        --timeout) TIMEOUT=$2; shift 2 ;;
+        --require) REQUIRE=$2; shift 2 ;;
+        -f) while IFS= read -r l; do l=${l%%#*}; l=$(echo "$l" | xargs); [ -n "$l" ] && TARGETS+=("$l"); done < "$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) echo "pqc-eval: unknown option $1" >&2; usage >&2; exit 2 ;;
+        *) TARGETS+=("$1"); shift ;;
+    esac
+done
+[ "${#TARGETS[@]}" -gt 0 ] || { usage >&2; exit 2; }
+case "$FORMAT" in table|tsv|json) ;; *) echo "pqc-eval: bad --format" >&2; exit 2 ;; esac
+pqc_openssl_ok || { echo "pqc-eval: needs OpenSSL >= 3.5 with ML-DSA/ML-KEM ($(openssl version)); run it from the pqc-web-tools image" >&2; exit 2; }
+[ -z "$PQC_CA" ] || [ -f "$PQC_CA" ] || { echo "pqc-eval: --ca $PQC_CA not found" >&2; exit 2; }
+
+HYBRID=$(_pqc_get PQC_GROUPS_HYBRID)
+CLASSIC_GROUPS=$(_pqc_get PQC_GROUPS_CLASSIC)
+SIG_PQC=$(_pqc_get PQC_SIGALGS_PQC)
+SIG_CLASSIC=$(_pqc_get PQC_SIGALGS_CLASSIC)
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# ---------------------------------------------------------------- one handshake
+
+# probe <connect> <sni> <cafile|""> <extra args...>
+# prints: ok proto group sigalg verify pk chain bytes days
+probe() {
+    local connect=$1 sni=$2 ca=$3; shift 3
+    local out leaf caargs=()
+    [ -n "$ca" ] && caargs=(-CAfile "$ca")
+    out=$(timeout "$TIMEOUT" openssl s_client -connect "$connect" -servername "$sni" -verify_hostname "$sni" \
+            -showcerts "${caargs[@]}" "$@" </dev/null 2>&1)
+    local proto group sig verify bytes chain pk days
+    proto=$(printf '%s\n' "$out" | sed -n 's/^New, \(TLSv1\.[0-9]\), Cipher.*/\1/p' | head -n 1)
+    if [ -z "$proto" ]; then echo "fail - - - - - - - -"; return; fi
+    group=$(printf '%s\n' "$out" | sed -n 's/^Negotiated TLS1.3 group: *//p' | head -n 1)
+    [ -n "$group" ] || group=$(printf '%s\n' "$out" | sed -n 's/^Server Temp Key: *\([^,]*\).*/\1/p' | head -n 1)
+    sig=$(printf '%s\n' "$out" | sed -n 's/^Peer signature type: *//p' | head -n 1)
+    verify=$(printf '%s\n' "$out" | sed -n 's/^ *Verify return code: \([0-9]*\).*/\1/p' | tail -n 1)
+    bytes=$(printf '%s\n' "$out" | sed -n 's/^SSL handshake has read \([0-9]*\) bytes.*/\1/p' | head -n 1)
+    chain=$(printf '%s\n' "$out" | grep -cE '^ *[0-9]+ s:')
+    leaf="$TMP/leaf.$$.$RANDOM.pem"
+    printf '%s\n' "$out" | awk '/-----BEGIN CERTIFICATE-----/{f=1} f{print} /-----END CERTIFICATE-----/{exit}' > "$leaf"
+    pk=$(leaf_pk "$leaf")
+    days=$(leaf_days "$leaf")
+    echo "ok ${proto:--} ${group:--} ${sig:--} ${verify:--} ${pk:--} ${chain:--} ${bytes:--} ${days:--}"
+}
+
+leaf_pk() {
+    local t
+    t=$(openssl x509 -in "$1" -noout -text 2>/dev/null) || { echo "-"; return; }
+    case "$(printf '%s\n' "$t" | sed -n 's/^ *Public Key Algorithm: *//p' | head -n 1)" in
+        ML-DSA-*) printf '%s\n' "$t" | sed -n 's/^ *Public Key Algorithm: *//p' | head -n 1 ;;
+        rsaEncryption) echo "RSA-$(printf '%s\n' "$t" | sed -n 's/.*Public-Key: (\([0-9]*\) bit).*/\1/p' | head -n 1)" ;;
+        id-ecPublicKey) echo "EC-$(printf '%s\n' "$t" | sed -n 's/^ *NIST CURVE: *//p; s/^ *ASN1 OID: *//p' | head -n 1)" ;;
+        ED25519) echo "ED25519" ;;
+        *) printf '%s\n' "$t" | sed -n 's/^ *Public Key Algorithm: *//p' | head -n 1 | tr ' ' '_' ;;
+    esac
+}
+
+leaf_days() {
+    local end now
+    end=$(openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2) || { echo "-"; return; }
+    [ -n "$end" ] || { echo "-"; return; }
+    end=$(date -d "$end" +%s 2>/dev/null) || { echo "-"; return; }
+    now=$(date +%s)
+    echo $(( (end - now) / 86400 ))
+}
+
+# ---------------------------------------------------------------- one target
+
+RESULTS=()   # one JSON object per target, assembled below
+ROWS=()      # TSV rows
+WORST=9
+
+level_num() { case "$1" in L0*) echo 0;; L1*) echo 1;; L2*) echo 2;; L3*) echo 3;; *) echo 9;; esac; }
+
+evaluate() {
+    local target=$1 host port connect sni
+    if [[ $target == \[*\]* ]]; then
+        host=${target%%]*}; host=${host#[}; port=${target##*]}; port=${port#:}
+        connect="[$host]:${port:-443}"
+    elif [[ $target == *:* && $target != *:*:* ]]; then
+        host=${target%:*}; port=${target##*:}; connect="$host:$port"
+    else
+        host=$target; port=443; connect="$host:443"
+    fi
+    port=${port:-443}
+    sni=${SNI:-$host}
+
+    local d h c t12 lg pq
+    read -r -a d   <<< "$(probe "$connect" "$sni" "$PQC_CA")"
+    local hyb_ok=()
+    for g in ${HYBRID//:/ }; do
+        read -r -a h <<< "$(probe "$connect" "$sni" "" -tls1_3 -groups "$g")"
+        [ "${h[0]}" = ok ] && [ "${h[2]}" = "$g" ] && hyb_ok+=("$g")
+    done
+    read -r -a c   <<< "$(probe "$connect" "$sni" "" -tls1_3 -groups "$CLASSIC_GROUPS")"
+    read -r -a t12 <<< "$(probe "$connect" "$sni" "" -tls1_2)"
+    read -r -a lg  <<< "$(probe "$connect" "$sni" "$CLASSIC_CA" -sigalgs "$SIG_CLASSIC")"
+    read -r -a pq  <<< "$(probe "$connect" "$sni" "$PQC_CA" -tls1_3 -groups "$HYBRID" -sigalgs "$SIG_PQC")"
+
+    local reach=no; [ "${d[0]}" = ok ] || [ "${lg[0]}" = ok ] || [ "${pq[0]}" = ok ] || [ "${t12[0]}" = ok ] && reach=yes
+    local hybrid="${hyb_ok[*]:-none}"; hybrid=${hybrid// /,}
+    local classic_kex=no; [ "${c[0]}" = ok ] && classic_kex=yes
+    local tls12=no; [ "${t12[0]}" = ok ] && tls12=yes
+    local legacy_auth="none"; [ "${lg[0]}" = ok ] && legacy_auth="${lg[5]}"
+    local pqc_auth="none";    [ "${pq[0]}" = ok ] && [[ ${pq[5]} == ML-DSA-* ]] && pqc_auth="${pq[5]}"
+    local default_gets="none"; [ "${d[0]}" = ok ] && default_gets="${d[5]}"
+    local pqc_verify="-"
+    if [ "$pqc_auth" != none ] && [ -n "$PQC_CA" ]; then
+        [ "${pq[4]}" = 0 ] && pqc_verify=ok || pqc_verify="error-${pq[4]}"
+    fi
+    local legacy_verify="-"
+    if [ "$legacy_auth" != none ]; then
+        [ "${lg[4]}" = 0 ] && legacy_verify=ok || legacy_verify="error-${lg[4]}"
+    fi
+
+    local level
+    if [ "$reach" = no ]; then level="ERR unreachable"
+    elif [ "$hybrid" = none ]; then level="L0 NO-PQC"
+    elif [ "$pqc_auth" = none ]; then level="L1 PQC-KEX"
+    elif [ "$legacy_auth" = none ]; then level="L3 PQC-ONLY"
+    else level="L2 DUAL"
+    fi
+
+    local profile="-"
+    case "$level" in
+        L3*) profile=pqc-only ;;
+        L2*) if [[ $default_gets == ML-DSA-* ]]; then profile=pqc-first; else profile=compat; fi ;;
+    esac
+
+    local notes=()
+    [ "$classic_kex" = yes ] && notes+=("classical-only key exchange accepted")
+    [ "$tls12" = yes ] && notes+=("TLS 1.2 accepted (no hybrid groups there)")
+    [ "$pqc_verify" != "-" ] && [ "$pqc_verify" != ok ] && notes+=("ML-DSA chain does not verify against --ca ($pqc_verify)")
+    [ "$legacy_verify" != "-" ] && [ "$legacy_verify" != ok ] && notes+=("classical chain does not verify ($legacy_verify)")
+    [ "$pqc_auth" != none ] && [ -z "$PQC_CA" ] && notes+=("ML-DSA chain not verified, pass --ca")
+    [ "${pq[8]:-"-"}" != "-" ] && [ "${pq[8]}" -lt 7 ] 2>/dev/null && notes+=("ML-DSA leaf expires in ${pq[8]} days")
+    [ "${lg[8]:-"-"}" != "-" ] && [ "${lg[8]}" -lt 7 ] 2>/dev/null && notes+=("classical leaf expires in ${lg[8]} days")
+    [ "${pq[7]:-"-"}" != "-" ] && [ "${pq[7]}" -gt 16000 ] 2>/dev/null && notes+=("PQC handshake ${pq[7]} bytes read (above ~14 KB initial window)")
+    [[ $profile == pqc-first ]] && [ -n "$PQC_CA" ] && notes+=("default OpenSSL 3.5 clients get the ML-DSA chain: they need the PQC root")
+    local note_s="" n
+    for n in "${notes[@]}"; do note_s="${note_s:+$note_s; }$n"; done
+
+    local lv; lv=$(level_num "$level"); [ "$lv" -lt "$WORST" ] && WORST=$lv
+
+    ROWS+=("$(printf '%s\t' "$target" "$sni" "$level" "$profile" "$hybrid" "$classic_kex" "$tls12" \
+        "$legacy_auth" "$legacy_verify" "$pqc_auth" "$pqc_verify" "$default_gets" "${pq[7]:--}" "${pq[8]:--}" "${lg[8]:--}")$note_s")
+
+    RESULTS+=("$(printf '{"target":"%s","sni":"%s","level":"%s","profile":"%s","hybrid_groups":"%s","classical_kex_accepted":"%s","tls12_accepted":"%s","legacy_auth":"%s","legacy_verify":"%s","pqc_auth":"%s","pqc_verify":"%s","default_client_gets":"%s","pqc_handshake_bytes":"%s","pqc_leaf_days":"%s","legacy_leaf_days":"%s","notes":"%s"}' \
+        "$target" "$sni" "$level" "$profile" "$hybrid" "$classic_kex" "$tls12" "$legacy_auth" "$legacy_verify" \
+        "$pqc_auth" "$pqc_verify" "$default_gets" "${pq[7]:--}" "${pq[8]:--}" "${lg[8]:--}" "${note_s//\"/\'}")")
+}
+
+for t in "${TARGETS[@]}"; do evaluate "$t"; done
+
+# ---------------------------------------------------------------- output
+
+HEAD="target	sni	level	profile	hybrid_groups	classic_kex	tls12	legacy_auth	legacy_verify	pqc_auth	pqc_verify	default_client_gets	pqc_hs_bytes	pqc_days	legacy_days	notes"
+case "$FORMAT" in
+    tsv)
+        echo "$HEAD"; printf '%s\n' "${ROWS[@]}" ;;
+    json)
+        printf '[\n'; n=${#RESULTS[@]}; i=0
+        for r in "${RESULTS[@]}"; do i=$((i+1)); printf '  %s%s\n' "$r" "$([ $i -lt $n ] && echo ,)"; done
+        printf ']\n' ;;
+    table)
+        echo "| Target | Level | Profile | Hybrid KEX | Classic KEX | TLS 1.2 | Legacy chain | PQC chain | Default client gets | PQC bytes | Days (pqc/legacy) |"
+        echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        for r in "${ROWS[@]}"; do
+            IFS=$'\t' read -r tg sn lvl pf hy ck t2 la lv pa pv dg pb pd ld nt <<< "$r"
+            echo "| $tg | $lvl | $pf | $hy | $ck | $t2 | $la ($lv) | $pa ($pv) | $dg | $pb | $pd / $ld |"
+        done
+        echo
+        for r in "${ROWS[@]}"; do
+            IFS=$'\t' read -r tg _ _ _ _ _ _ _ _ _ _ _ _ _ _ nt <<< "$r"
+            [ -n "$nt" ] && echo "- $tg: $nt"
+        done ;;
+esac
+
+if [ -n "$REQUIRE" ]; then
+    [ "$WORST" -ge "$(level_num "$REQUIRE")" ] || exit 1
+fi
+exit 0

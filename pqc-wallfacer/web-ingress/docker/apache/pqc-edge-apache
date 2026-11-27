@@ -1,0 +1,159 @@
+#!/bin/sh
+# pqc-edge-apache: render and run a dual-stack (classical + ML-DSA) TLS edge on Apache httpd 2.4 in front
+# of an existing ingress controller or web backend. Configuration through environment, see lib/edge-common.sh.
+set -eu
+
+PQC_SHARE=${PQC_SHARE:-/usr/local/share/pqc-web}
+# shellcheck source=../../lib/edge-common.sh
+. "$PQC_SHARE/edge-common.sh"
+
+PQC_PROXY_TIMEOUT=${PQC_PROXY_TIMEOUT:-300}
+export APACHE_RUN_DIR="$PQC_RUN/run" APACHE_LOCK_DIR="$PQC_RUN/lock" APACHE_LOG_DIR="$PQC_RUN/log" \
+       APACHE_PID_FILE="$PQC_RUN/apache2.pid" APACHE_RUN_USER=www-data APACHE_RUN_GROUP=www-data
+
+listen_addrs() {
+    echo "Listen $PQC_LISTEN_HTTP"
+    echo "Listen $PQC_LISTEN_TLS https"
+}
+
+tls_common() {   # indent
+    i=$1
+    min=$(echo "$PROFILE_PROTOCOLS" | tr ' ' '\n' | sort | head -n 1)
+    cat <<EOF
+${i}SSLEngine on
+${i}SSLProtocol -all +TLSv1.2 +TLSv1.3
+${i}SSLOpenSSLConfCmd MinProtocol $min
+${i}SSLOpenSSLConfCmd Options ServerPreference
+${i}SSLOpenSSLConfCmd Groups $PROFILE_GROUPS
+${i}SSLOpenSSLConfCmd SignatureAlgorithms $PROFILE_SIGALGS
+${i}SSLSessionTickets off
+EOF
+    [ "$PQC_PROXY_PROTOCOL" = yes ] && echo "${i}RemoteIPProxyProtocol On"
+    return 0
+}
+
+proxy_block() {   # upstream
+    up=${1%/}
+    cat <<EOF
+    ProxyPreserveHost On
+    ProxyTimeout $PQC_PROXY_TIMEOUT
+    RequestHeader set X-Forwarded-Proto "https"
+    RequestHeader set X-Forwarded-Port "$PQC_FORWARDED_PORT"
+    RequestHeader set X-PQC-TLS-Protocol "%{SSL_PROTOCOL}s"
+    ProxyPass / $up/ upgrade=websocket
+    ProxyPassReverse / $up/
+EOF
+    case "$up" in
+        https://*)
+            echo "    SSLProxyEngine on"
+            echo "    SSLProxyProtocol -all +TLSv1.2 +TLSv1.3"
+            if [ -n "$PQC_UPSTREAM_CA" ]; then
+                echo "    SSLProxyVerify require"
+                echo "    SSLProxyCheckPeerName on"
+                echo "    SSLProxyCACertificateFile $PQC_UPSTREAM_CA"
+            else
+                echo "    SSLProxyVerify none"
+                echo "    SSLProxyCheckPeerName off"
+                echo "    SSLProxyCheckPeerExpire off"
+            fi ;;
+    esac
+}
+
+render() {   # outdir
+    out=$1; rm -rf "$out"; mkdir -p "$out" "$PQC_RUN/www"
+    echo ok > "$PQC_RUN/www/healthz"
+    edge_sites > "$out/sites.list"
+    [ -s "$out/sites.list" ] || { log "no valid sites in $PQC_SITES_DIR"; return 1; }
+    first=$(head -n 1 "$out/sites.list")
+    f_pc=$(echo "$first" | cut -d'|' -f3); f_pk=$(echo "$first" | cut -d'|' -f4)
+    f_cc=$(echo "$first" | cut -d'|' -f5); f_ck=$(echo "$first" | cut -d'|' -f6)
+    {
+        cat <<EOF
+# rendered by pqc-edge-apache, profile=$PROFILE_NAME
+ServerRoot /etc/apache2
+DefaultRuntimeDir \${APACHE_RUN_DIR}
+PidFile \${APACHE_PID_FILE}
+Mutex file:\${APACHE_LOCK_DIR} default
+Timeout 300
+KeepAlive On
+ServerName pqc-edge
+ServerTokens Prod
+ServerSignature Off
+TraceEnable Off
+HostnameLookups Off
+ErrorLog /dev/stderr
+LogLevel warn
+IncludeOptional mods-enabled/*.load
+IncludeOptional mods-enabled/*.conf
+LogFormat "%a \"%{Host}i\" \"%r\" %>s %{SSL_PROTOCOL}x \"%{User-Agent}i\"" pqc
+CustomLog /dev/stdout pqc
+SSLSessionCache shmcb:\${APACHE_RUN_DIR}/ssl_scache(512000)
+Protocols h2 http/1.1
+$(listen_addrs)
+
+# plain HTTP: health and redirect
+<VirtualHost *:$PQC_LISTEN_HTTP>
+    ServerName pqc-edge-http
+    DocumentRoot $PQC_RUN/www
+    <Directory $PQC_RUN/www>
+        Require all granted
+    </Directory>
+    RewriteEngine On
+    RewriteRule ^/healthz$ - [L]
+EOF
+        if [ "$PQC_HTTP_REDIRECT" = yes ]; then
+            echo "    RewriteRule ^/?(.*) https://%{HTTP_HOST}/\$1 [R=301,L]"
+        else
+            proxy_block "$PQC_UPSTREAM" | sed 's/"https"/"http"/' | grep -v '^    ProxyPass / '
+            echo "    ProxyPass /healthz !"
+            echo "    ProxyPass / ${PQC_UPSTREAM%/}/ upgrade=websocket"
+        fi
+        echo "</VirtualHost>"
+        echo
+        echo "# default TLS vhost: decides key exchange groups and protocol floor for every SNI name"
+        echo "<VirtualHost *:$PQC_LISTEN_TLS>"
+        echo "    ServerName pqc-edge-default.invalid"
+        tls_common "    "
+        [ -n "$f_cc" ] && echo "    SSLCertificateFile $f_cc" && echo "    SSLCertificateKeyFile $f_ck"
+        echo "    SSLCertificateFile $f_pc"; echo "    SSLCertificateKeyFile $f_pk"
+        echo "    RewriteEngine On"
+        echo "    RewriteRule ^ - [R=421,L]"
+        echo "</VirtualHost>"
+        while IFS='|' read -r site names pc pk cc ck up; do
+            first_name=$(echo "$names" | awk '{print $1}')
+            rest=$(echo "$names" | cut -s -d' ' -f2-)
+            echo
+            echo "# site $site"
+            echo "<VirtualHost *:$PQC_LISTEN_TLS>"
+            echo "    ServerName $first_name"
+            [ -n "$rest" ] && echo "    ServerAlias $rest"
+            tls_common "    "
+            [ -n "$cc" ] && echo "    SSLCertificateFile $cc" && echo "    SSLCertificateKeyFile $ck"
+            echo "    SSLCertificateFile $pc"; echo "    SSLCertificateKeyFile $pk"
+            [ -n "$PQC_HSTS" ] && echo "    Header always set Strict-Transport-Security \"$PQC_HSTS\""
+            proxy_block "$up"
+            echo "</VirtualHost>"
+        done < "$out/sites.list"
+    } > "$out/apache2.conf"
+    log "rendered $(wc -l < "$out/sites.list") site(s), profile $PROFILE_NAME"
+}
+
+test_conf() { apache2 -f "$1/apache2.conf" -t 2>&1 | grep -v '^Syntax OK$' >&2 || true; apache2 -f "$1/apache2.conf" -t >/dev/null 2>&1; }
+reload() { apache2 -f "$PQC_RUN/live/apache2.conf" -k graceful; }
+
+case "${1:-run}" in
+    run)
+        edge_preflight
+        mkdir -p "$APACHE_RUN_DIR" "$APACHE_LOCK_DIR" "$APACHE_LOG_DIR"
+        render "$PQC_RUN/live" || fail "nothing to serve"
+        test_conf "$PQC_RUN/live" || fail "rendered configuration does not pass apache2 -t"
+        if [ "$PQC_RELOAD_INTERVAL" -gt 0 ]; then
+            watch_loop render test_conf reload &
+        fi
+        exec apache2 -f "$PQC_RUN/live/apache2.conf" -DFOREGROUND
+        ;;
+    render)
+        edge_preflight; mkdir -p "$APACHE_RUN_DIR" "$APACHE_LOCK_DIR" "$APACHE_LOG_DIR"
+        render "$PQC_RUN/dry" && cat "$PQC_RUN/dry/apache2.conf" ;;
+    *) exec "$@" ;;
+esac

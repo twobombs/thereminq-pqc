@@ -1,0 +1,17 @@
+# Dual-stack (IPv4 + IPv6) load balancer. PreferDualStack falls back to single stack on IPv4-only clusters.
+# externalTrafficPolicy Local keeps the client address for X-Forwarded-For.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pqc-edge
+  namespace: pqc-edge
+  labels: {app.kubernetes.io/name: pqc-edge}
+spec:
+  type: LoadBalancer
+  ipFamilyPolicy: PreferDualStack
+  ipFamilies: [IPv4, IPv6]
+  externalTrafficPolicy: Local
+  selector: {app.kubernetes.io/name: pqc-edge}
+  ports:
+    - {name: https, port: 443, targetPort: https, protocol: TCP}
+    - {name: http, port: 80, targetPort: http, protocol: TCP}
